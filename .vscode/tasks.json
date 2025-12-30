@@ -1,0 +1,16 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Upload RobotPI",
+      "type": "shell",
+      "command": "pio run"
+    },
+    {
+      "label": "ESP32: Deploy via Raspberry Pi",
+      "type": "shell",
+      "command": "scp .pio/build/esp32/firmware.bin robot-pi:/tmp/firmware.bin && ssh robot-pi '~/.local/bin/esptool --chip esp32 --port /dev/ttyUSB1 --baud 460800 write_flash 0x10000 /tmp/firmware.bin'", 
+      "problemMatcher": []
+    }
+  ]
+}
