@@ -19,7 +19,7 @@
 
 #define WDT_TIMEOUT 2              // Secsonds
 #define AGENT_DEAD_TIMEOUT_MS 5000 // Milliseconds
-#define AGENT_ALIVE_CHECK_MS 1000  // Milliseconds
+#define AGENT_ALIVE_CHECK_MS 100  // Milliseconds
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -68,13 +68,8 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (timer == NULL)
     return;
 
-  int64_t now = now_ms();
-  if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
-    if (now - last_agent_ok_ms > AGENT_DEAD_TIMEOUT_MS) {
-      esp_restart();
-    }
-  } else {
-    last_agent_ok_ms = now;
+  if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
+    last_agent_ok_ms = now_ms();
   }
 }
 
@@ -87,8 +82,8 @@ void setup() {
   set_microros_serial_transports(Serial);
   delay(2000); // wait for agent
 
-  // esp_task_wdt_init(WDT_TIMEOUT, true);
-  // esp_task_wdt_add(NULL); // loop task
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL); // loop task
 
   // wait for agent
   while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
@@ -127,15 +122,26 @@ void setup() {
   rclc_timer_init_default2(&imu_timer, &support, timer_period_ns,
                            imu_timer_callback, true);
 
-  rclc_timer_init_default2(&agent_alive_timer, &support, RCL_MS_TO_NS(1000),
+  rclc_timer_init_default2(&agent_alive_timer, &support, RCL_MS_TO_NS(AGENT_ALIVE_CHECK_MS),
                            agent_alive_timer_callback, true);
 
   rclc_executor_init(&executor, &support.context, 2, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
-  // Initial l
+
   RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node started");
 }
 
 // ---------------- Arduino loop ----------------
-void loop() { rclc_executor_spin_some(&executor, RCL_MS_TO_NS(20)); }
+void loop() { 
+    if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)) != RCL_RET_OK) {
+     delay(1);
+    }
+
+    if (now_ms() - last_agent_ok_ms > AGENT_DEAD_TIMEOUT_MS) {
+      esp_restart();
+    } else   
+    {
+        esp_task_wdt_reset();
+    }
+}
