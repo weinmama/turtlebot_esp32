@@ -17,10 +17,13 @@
 
 #include "esp_task_wdt.h"
 
-#define WDT_TIMEOUT 5 // Secsonds
+#define WDT_TIMEOUT 2              // Secsonds
+#define AGENT_DEAD_TIMEOUT_MS 5000 // Milliseconds
+#define AGENT_ALIVE_CHECK_MS 1000  // Milliseconds
 #define SDA_PIN 21
 #define SCL_PIN 22
 
+static const char *TAG = "MICROROS_WDT";
 // -------------------- IMU --------------------
 Adafruit_MPU6050 imu;
 
@@ -28,11 +31,13 @@ Adafruit_MPU6050 imu;
 rclc_support_t support;
 rcl_node_t node;
 rcl_timer_t imu_timer;
+rcl_timer_t agent_alive_timer;
 rclc_executor_t executor;
 
 rcl_publisher_t rosout_pub;
 rcl_publisher_t imu_pub;
 
+static int64_t last_agent_ok_ms = 0;
 // -------------------- Messages --------------------
 std_msgs__msg__Float32MultiArray imu_msg;
 rcl_interfaces__msg__Log log_msg;
@@ -56,6 +61,23 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   rcl_publish(&imu_pub, &imu_msg, NULL);
 }
 
+static int64_t now_ms(void) { return (esp_timer_get_time() / 1000); }
+
+void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+  (void)last_call_time;
+  if (timer == NULL)
+    return;
+
+  int64_t now = now_ms();
+  if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+    if (now - last_agent_ok_ms > AGENT_DEAD_TIMEOUT_MS) {
+      esp_restart();
+    }
+  } else {
+    last_agent_ok_ms = now;
+  }
+}
+
 // ---------------- Arduino setup ----------------
 void setup() {
   Serial.begin(115200);
@@ -65,8 +87,14 @@ void setup() {
   set_microros_serial_transports(Serial);
   delay(2000); // wait for agent
 
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL); // loop task
+  // esp_task_wdt_init(WDT_TIMEOUT, true);
+  // esp_task_wdt_add(NULL); // loop task
+
+  // wait for agent
+  while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+    delay(1000);
+    esp_task_wdt_reset();
+  }
 
   Wire.begin(SDA_PIN, SCL_PIN);
   if (!imu.begin()) {
@@ -96,18 +124,18 @@ void setup() {
   imu_msg.data.data = (float *)malloc(6 * sizeof(float));
 
   const uint64_t timer_period_ns = RCL_MS_TO_NS(20);
-  rclc_timer_init_default(&imu_timer, &support, timer_period_ns,
-                          imu_timer_callback);
+  rclc_timer_init_default2(&imu_timer, &support, timer_period_ns,
+                           imu_timer_callback, true);
 
-  rclc_executor_init(&executor, &support.context, 1, &allocator);
+  rclc_timer_init_default2(&agent_alive_timer, &support, RCL_MS_TO_NS(1000),
+                           agent_alive_timer_callback, true);
+
+  rclc_executor_init(&executor, &support.context, 2, &allocator);
+  rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
-
   // Initial l
   RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node started");
 }
 
 // ---------------- Arduino loop ----------------
-void loop() {
-  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
-  esp_task_wdt_reset();
-}
+void loop() { rclc_executor_spin_some(&executor, RCL_MS_TO_NS(20)); }
