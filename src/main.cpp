@@ -22,6 +22,7 @@
 #define AGENT_ALIVE_CHECK_MS 100   // Milliseconds
 #define SDA_PIN 21
 #define SCL_PIN 22
+#define COM_RATE 115200
 
 static const char *TAG = "MICROROS_WDT";
 // -------------------- IMU --------------------
@@ -75,7 +76,7 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
 // ---------------- Arduino setup ----------------
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(COM_RATE);
   delay(2000);
 
   // Initialize micro-ROS serial transport
