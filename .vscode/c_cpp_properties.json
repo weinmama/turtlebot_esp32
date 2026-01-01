@@ -10,6 +10,7 @@
             "includePath": [
                 "/mnt/data/projects/turtlebot_lowlevel/include",
                 "/mnt/data/projects/turtlebot_lowlevel/src",
+                "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/PID",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit MPU6050",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit Unified Sensor",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit BusIO",
@@ -256,6 +257,7 @@
                 "path": [
                     "/mnt/data/projects/turtlebot_lowlevel/include",
                     "/mnt/data/projects/turtlebot_lowlevel/src",
+                    "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/PID",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit MPU6050",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit Unified Sensor",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit BusIO",
