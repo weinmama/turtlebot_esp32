@@ -25,18 +25,18 @@
 #define COM_RATE 115200
 
 // L298N H-Bridge Connection PINs
-#define L298N_enB 25 // PWM
-#define L298N_enA 14 // PWM
-#define L298N_in2 32 // Dir Motor B
-#define L298N_in1 33 // Dir Motor B
-#define L298N_in4 27 // Dir Motor A
-#define L298N_in3 26 // Dir Motor A
+#define L298N_enB 14 // PWM
+#define L298N_enA 27 // PWM
+#define L298N_in2 25 // Dir Motor B
+#define L298N_in1 26 // Dir Motor B
+#define L298N_in4 32 // Dir Motor A
+#define L298N_in3 33 // Dir Motor A
 
 // Wheel Encoders Connection PINs
-#define right_encoder_phaseA 23 // Interrupt
-#define right_encoder_phaseB 15
-#define left_encoder_phaseA 18 // Interrupt
-#define left_encoder_phaseB 13
+#define right_encoder_phaseA 4 // Interrupt
+#define right_encoder_phaseB 0
+#define left_encoder_phaseA 2 // Interrupt
+#define left_encoder_phaseB 15
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -185,11 +185,12 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     left_wheel_cmd = 0.0;
   }
 
-  right_wheel_cmd = 100;
-  left_wheel_cmd = 150;
-  // Set Motor PWM
-  analogWrite(L298N_enA, constrain(abs(right_wheel_cmd), 0, 255));
-  analogWrite(L298N_enB, constrain(abs(left_wheel_cmd), 0, 255));
+  right_wheel_cmd = 160;
+  left_wheel_cmd = 160;
+  // Set Motor PWM using LEDC
+  // Ensure duty is 0-255 and convert to int for ledcWrite
+  ledcWrite(0, (int)constrain(abs(right_wheel_cmd), 0, 255));
+  ledcWrite(1, (int)constrain(abs(left_wheel_cmd), 0, 255));
 }
 
 void cmd_vel_callback(const void *msgin) {
@@ -231,6 +232,16 @@ void setup() {
 
   rightMotor.SetMode(AUTOMATIC);
   leftMotor.SetMode(AUTOMATIC);
+
+  // Configure LEDC PWM for motor enable pins
+  const int pwmFreq = 20000; // 20 kHz
+  const int pwmResolution = 8; // 8-bit (0-255)
+  // Channel 0 -> Right motor (L298N_enA)
+  // Channel 1 -> Left motor  (L298N_enB)
+  ledcSetup(0, pwmFreq, pwmResolution);
+  ledcAttachPin(L298N_enA, 0);
+  ledcSetup(1, pwmFreq, pwmResolution);
+  ledcAttachPin(L298N_enB, 1);
 
   // Init encoders
   pinMode(right_encoder_phaseB, INPUT);
