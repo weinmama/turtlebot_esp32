@@ -33,10 +33,10 @@
 #define L298N_in3 33 // Dir Motor A
 
 // Wheel Encoders Connection PINs
-#define right_encoder_phaseA 4 // Interrupt
-#define right_encoder_phaseB 0
-#define left_encoder_phaseA 2 // Interrupt
-#define left_encoder_phaseB 15
+#define right_encoder_phaseA 19 // Interrupt
+#define right_encoder_phaseB 18
+#define left_encoder_phaseA 5 
+#define left_encoder_phaseB 17
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -184,13 +184,11 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (left_wheel_cmd_vel == 0.0) {
     left_wheel_cmd = 0.0;
   }
-
-  right_wheel_cmd = 160;
-  left_wheel_cmd = 160;
+  
   // Set Motor PWM using LEDC
   // Ensure duty is 0-255 and convert to int for ledcWrite
-  ledcWrite(0, (int)constrain(abs(right_wheel_cmd), 0, 255));
-  ledcWrite(1, (int)constrain(abs(left_wheel_cmd), 0, 255));
+  ledcWrite(0, (int)constrain(abs(left_wheel_cmd), 0, 255));
+  ledcWrite(1, (int)constrain(abs(right_wheel_cmd), 0, 255));
 }
 
 void cmd_vel_callback(const void *msgin) {
@@ -234,7 +232,7 @@ void setup() {
   leftMotor.SetMode(AUTOMATIC);
 
   // Configure LEDC PWM for motor enable pins
-  const int pwmFreq = 20000; // 20 kHz
+  const int pwmFreq = 500; // 500Hz
   const int pwmResolution = 8; // 8-bit (0-255)
   // Channel 0 -> Right motor (L298N_enA)
   // Channel 1 -> Left motor  (L298N_enB)
@@ -306,7 +304,7 @@ void setup() {
                            RCL_MS_TO_NS(MOTOR_CONTROL_MS), motor_timer_callback,
                            true);
 
-  rclc_executor_init(&executor, &support.context, 3, &allocator);
+  rclc_executor_init(&executor, &support.context, 4, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
   rclc_executor_add_timer(&executor, &motor_timer);
