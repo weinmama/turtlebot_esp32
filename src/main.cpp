@@ -88,13 +88,13 @@ const float A_MAX = 0.5;     // m/s²
 const float ALPHA_MAX = 2.0; // rad/s²
 
 /************** Control **************/
-float v_cmd = 0.0; // velocity [m/s]
-float w_cmd = 0.0; // angular velocity [rad/s]
+static float v_cmd = 0.0; // velocity [m/s]
+static float w_cmd = 0.0; // angular velocity [rad/s]
 
-float v = 0.0; // ramped velocity
-float w = 0.0;
+static float v = 0.0; // ramped velocity
+static float w = 0.0;
 
-float Kp = 1.8;
+float Kp = 2.1;
 float Ki = 0.6;
 
 const float MIN_SPEED_X = 0.01;
@@ -131,7 +131,7 @@ void brakeMotor(int in1, int in2);
 // ===== Encoder ISRs =====
 
 void isrLeft() { ticks_L += (digitalRead(ENC_B_L) == HIGH) ? 1 : -1; }
-void isrRight() { ticks_R += (digitalRead(ENC_B_R) == HIGH) ? 1 : -1; }
+void isrRight() { ticks_R -= (digitalRead(ENC_B_R) == HIGH) ? 1 : -1; }
 
 // ===== Timer callback (50 Hz) =====
 void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
@@ -174,7 +174,6 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
   if (dt <= 0.0f || dt > 0.5f)
     return;
-  if (dt <= 0 || dt > 0.5f) return;
 
   // -------- Ramp --------
   v += constrain(v_cmd - v, -A_MAX * dt, A_MAX * dt);
@@ -259,16 +258,15 @@ void setup() {
   // Initialize micro-ROS serial transport
   set_microros_serial_transports(Serial);
   // delay(2000); // wait for agent
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL); // loop task
-
+ 
   while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
     delay(1000);
-    esp_task_wdt_reset();
   }
 
   // wait for agent
-
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL); 
+  
   Wire.begin(SDA_PIN, SCL_PIN);
   if (!imu.begin()) {
     RCUTILS_LOG_ERROR("Failed to find MPU6050 chip");
@@ -280,7 +278,6 @@ void setup() {
   // Allocator & support
   rcl_allocator_t allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
-  esp_task_wdt_reset();
   // Create node
   rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
 
@@ -306,7 +303,6 @@ void setup() {
   rclc_timer_init_default2(&motor_timer, &support,
                            RCL_MS_TO_NS(MOTOR_CONTROL_RATE_MS),
                            motor_timer_callback, true);
-  esp_task_wdt_reset();
   rclc_executor_init(&executor, &support.context, 4, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
@@ -320,7 +316,7 @@ void setup() {
                                  &cmd_vel_callback, ON_NEW_DATA);
 
   RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node started");
-  esp_task_wdt_reset();
+
 }
 
 // ---------------- Arduino loop ----------------
