@@ -1,7 +1,6 @@
-#include <Arduino.h>
-#include <PID_v1.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <Arduino.h>
 #include <Wire.h>
 
 #include <micro_ros_platformio.h>
@@ -11,10 +10,10 @@
 #include <rcutils/logging_macros.h>
 #include <rmw_microros/rmw_microros.h>
 
+#include <geometry_msgs/msg/twist.h>
 #include <rcl_interfaces/msg/log.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <std_msgs/msg/string.h>
-#include <geometry_msgs/msg/twist.h>
 
 #include "esp_task_wdt.h"
 
@@ -22,6 +21,9 @@
 #define WDT_TIMEOUT 2              // Secsonds
 #define AGENT_DEAD_TIMEOUT_MS 5000 // Milliseconds
 #define AGENT_ALIVE_CHECK_MS 100   // Milliseconds
+#define MOTOR_CONTROL_RATE_MS 100  // Milliseconds
+#define EXECUTOR_SPIN_RATE_MS 5    // Milliseconds
+#define IMU_UPDATE_RATE_MS 20      // Milliseconds
 #define COM_RATE 115200
 
 // L298N H-Bridge Connection PINs
@@ -35,8 +37,25 @@
 // Wheel Encoders Connection PINs
 #define right_encoder_phaseA 19 // Interrupt
 #define right_encoder_phaseB 18
-#define left_encoder_phaseA 5 
+#define left_encoder_phaseA 5
 #define left_encoder_phaseB 17
+
+/************** Pins **************/
+// left wheel
+#define ENA_L 27
+#define IN1_L 33
+#define IN2_L 32
+#define ENC_A_L 5
+#define ENC_B_L 17
+
+// right wheel
+#define ENA_R 14
+#define IN1_R 26
+#define IN2_R 25
+#define ENC_A_R 19
+#define ENC_B_R 18
+
+// IMU I2C Pins
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -54,65 +73,65 @@ rclc_executor_t executor;
 rcl_publisher_t rosout_pub;
 rcl_publisher_t imu_pub;
 
-// config for wheels
-#define MOTOR_CONTROL_MS 100 // ms
-double right_wheel_radius = 0.034; // meters
-double left_wheel_radius = 0.034;  // meters
-double wheel_base = 0.16; // meters (distance between wheels)
+/************** Robot Parameter **************/
+const float WHEEL_RADIUS = 0.034; // m
+const float WHEEL_BASE = 0.20;    // m
+const float WHEEL_CIRC = 2 * PI * WHEEL_RADIUS;
+const int PULSES_PER_REV = 614;
 
-double right_max_rpm = 100.0; // revolutions per minute
-double left_max_rpm = 100.0;  // revolutions per minute
+/************** L298 **************/
+const int PWM_DEADBAND = 60;
+const int PWM_MAX = 255;
+
+/************** Ramps **************/
+const float A_MAX = 0.5;     // m/s²
+const float ALPHA_MAX = 2.0; // rad/s²
+
+/************** Control **************/
+float v_cmd = 0.0; // velocity [m/s]
+float w_cmd = 0.0; // angular velocity [rad/s]
+
+float v = 0.0; // ramped velocity
+float w = 0.0;
+
+float Kp = 1.8;
+float Ki = 0.6;
+
+const float MIN_SPEED_X = 0.01;
+const float MIN_ANGULAR_SPEED_Z = 0.0001;
+
+/************** Encoder **************/
+volatile long ticks_L = 0;
+volatile long ticks_R = 0;
+
+/************** Motor **************/
+int pwm_L = 0, pwm_R = 0;
+float int_L = 0, int_R = 0;
+
+/************** Odometry **************/
+float x = 0.0, y = 0.0, theta = 0.0;
 
 // cmd_vel subscriber
 rcl_subscription_t cmd_vel_sub;
 geometry_msgs__msg__Twist cmd_vel_msg;
 void cmd_vel_callback(const void *msgin);
 
-// PID parameters
-// Setpoint - Desired
-double right_wheel_cmd_vel = 0.0;      // rad/s
-double last_right_wheel_cmd_vel = 0.0; // rad/s
-double left_wheel_cmd_vel = 0.0;       // rad/s
-double last_left_wheel_cmd_vel = 0.0;  // rad/s
-
-// Input - Measurement
-double right_wheel_meas_vel = 0.0; // rad/s
-double left_wheel_meas_vel = 0.0;  // rad/s
-// Output - Command
-double right_wheel_cmd = 0.0; // 0-255
-double left_wheel_cmd = 0.0;  // 0-255
-// Tuning
-double Kp_r = 11.5;
-double Ki_r = 7.5;
-double Kd_r = 0.1;
-double Kp_l = 12.8;
-double Ki_l = 8.3;
-double Kd_l = 0.1;
-// Controller
-PID rightMotor(&right_wheel_meas_vel, &right_wheel_cmd, &right_wheel_cmd_vel,
-               Kp_r, Ki_r, Kd_r, DIRECT);
-PID leftMotor(&left_wheel_meas_vel, &left_wheel_cmd, &left_wheel_cmd_vel, Kp_l,
-              Ki_l, Kd_l, DIRECT);
-
-// forward declarations
-void leftEncoderCallback();
-void rightEncoderCallback();
-
-enum wheel_sign_t { POSITIVE, NEGATIVE };
-
-// Encoders
-uint64_t right_encoder_counter = 0;
-uint64_t left_encoder_counter = 0;
-wheel_sign_t right_wheel_sign = POSITIVE; 
-wheel_sign_t left_wheel_sign = POSITIVE;  
-uint64_t last_millis = 0;
-const uint64_t interval = 100;
 // Alive check
 static int64_t last_agent_ok_ms = 0;
 
 // -------------------- Messages --------------------
 std_msgs__msg__Float32MultiArray imu_msg;
 rcl_interfaces__msg__Log log_msg;
+
+// forward declarations - Motor helpers
+int motorPI(float target_rpm, float actual_rpm, float &integral, float dt);
+void setDir(float v, int in1, int in2);
+void brakeMotor(int in1, int in2);
+
+// ===== Encoder ISRs =====
+
+void isrLeft() { ticks_L += (digitalRead(ENC_B_L) == HIGH) ? 1 : -1; }
+void isrRight() { ticks_R += (digitalRead(ENC_B_R) == HIGH) ? 1 : -1; }
 
 // ===== Timer callback (50 Hz) =====
 void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
@@ -144,127 +163,111 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     last_agent_ok_ms = now_ms();
   }
 }
+static int64_t last_time_ns = 0;
 
 void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (timer == NULL)
     return;
 
-  uint64_t interval = last_call_time / 1000000; // interval in ms from ns
+  float dt = last_call_time / 1e9f; // interval ns in secs
 
-  // Right Wheel
-  if (right_wheel_sign == wheel_sign_t::POSITIVE) {
-    right_wheel_meas_vel =
-        (right_encoder_counter * 2.0 * 3.1416) / (interval / 1000.0);
+
+  if (dt <= 0.0f || dt > 0.5f)
+    return;
+  if (dt <= 0 || dt > 0.5f) return;
+
+  // -------- Ramp --------
+  v += constrain(v_cmd - v, -A_MAX * dt, A_MAX * dt);
+  w += constrain(w_cmd - w, -ALPHA_MAX * dt, ALPHA_MAX * dt);
+
+  // -------- Diff Drive --------
+  float vL = v - w * WHEEL_BASE / 2.0f;
+  float vR = v + w * WHEEL_BASE / 2.0f;
+
+  float rpmL_target = vL / WHEEL_CIRC * 60.0f;
+  float rpmR_target = vR / WHEEL_CIRC * 60.0f;
+
+  // -------- Encoder --------
+  noInterrupts();
+  long dL = ticks_L; ticks_L = 0;
+  long dR = ticks_R; ticks_R = 0;
+  interrupts();
+
+  float dsL = (float)dL / PULSES_PER_REV * WHEEL_CIRC;
+  float dsR = (float)dR / PULSES_PER_REV * WHEEL_CIRC;
+
+  // -------- Odometry --------
+  float ds = (dsR + dsL) * 0.5f;
+  float dtheta = (dsR - dsL) / WHEEL_BASE;
+
+  x += ds * cos(theta + dtheta * 0.5f);
+  y += ds * sin(theta + dtheta * 0.5f);
+  theta += dtheta;
+
+  // -------- RPM --------
+  float rpmL = (dsL / WHEEL_CIRC) / dt * 60.0f;
+  float rpmR = (dsR / WHEEL_CIRC) / dt * 60.0f;
+
+  // -------- Control --------
+  if (vL == 0.0f) {
+    brakeMotor(IN1_L, IN2_L);
+    analogWrite(ENA_L, 0);
+    int_L = 0;
   } else {
-    right_wheel_meas_vel =
-        -(right_encoder_counter * 2.0 * 3.1416) / (interval / 1000.0);
+    setDir(vL, IN1_L, IN2_L);
+    int pwm = motorPI(rpmL_target, rpmL, int_L, dt);
+    analogWrite(ENA_L, pwm);
   }
-  right_encoder_counter = 0;
 
-  // Left Wheel
-  if (left_wheel_sign == wheel_sign_t::POSITIVE) {
-    left_wheel_meas_vel =
-        (left_encoder_counter * 2.0 * 3.1416) / (interval / 1000.0);
+  if (vR == 0.0f) {
+    brakeMotor(IN1_R, IN2_R);
+    analogWrite(ENA_R, 0);
+    int_R = 0;
   } else {
-    left_wheel_meas_vel =
-        -(left_encoder_counter * 2.0 * 3.1416) / (interval / 1000.0);
+    setDir(vR, IN1_R, IN2_R);
+    int pwm = motorPI(rpmR_target, rpmR, int_R, dt);
+    analogWrite(ENA_R, pwm);
   }
-
-  left_encoder_counter = 0;
-  right_encoder_counter = 0;
-
-  // Compute new PID output
-  rightMotor.Compute();
-  leftMotor.Compute();
-
-  // Ignore commands smaller than inertia
-  if (right_wheel_cmd_vel == 0.0) {
-    right_wheel_cmd = 0.0;
-  }
-  if (left_wheel_cmd_vel == 0.0) {
-    left_wheel_cmd = 0.0;
-  }
-  
-  // Set Motor PWM using LEDC
-  // Ensure duty is 0-255 and convert to int for ledcWrite
-  ledcWrite(0, (int)constrain(abs(left_wheel_cmd), 0, 255));
-  ledcWrite(1, (int)constrain(abs(right_wheel_cmd), 0, 255));
 }
 
 void cmd_vel_callback(const void *msgin) {
-  const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
-  double v = msg->linear.x;
-  double w = msg->angular.z;
-
-  double right = (v + (w * wheel_base / 2.0)) / right_wheel_radius;
-  double left = (v - (w * wheel_base / 2.0)) / left_wheel_radius;
-
-  double right_max_rad_s = (right_max_rpm * 2.0 * 3.141592653589793) / 60.0;
-  double left_max_rad_s = (left_max_rpm * 2.0 * 3.141592653589793) / 60.0;
-
-  if (right > right_max_rad_s) right = right_max_rad_s;
-  if (right < -right_max_rad_s) right = -right_max_rad_s;
-  if (left > left_max_rad_s) left = left_max_rad_s;
-  if (left < -left_max_rad_s) left = -left_max_rad_s;
-
-  right_wheel_cmd_vel = right;
-  left_wheel_cmd_vel = left;
+  const geometry_msgs__msg__Twist *msg =
+      (const geometry_msgs__msg__Twist *)msgin;
+  v_cmd = fabs(msg->linear.x) < MIN_SPEED_X ? 0.0f : msg->linear.x;
+  w_cmd = fabs(msg->angular.z) < MIN_ANGULAR_SPEED_Z ? 0.0f : msg->angular.z;
 }
 
 // ---------------- Arduino setup ----------------
 void setup() {
 
-  // Init L298N H-Bridge Connection PINs
-  pinMode(L298N_enA, OUTPUT);
-  pinMode(L298N_enB, OUTPUT);
-  pinMode(L298N_in1, OUTPUT);
-  pinMode(L298N_in2, OUTPUT);
-  pinMode(L298N_in3, OUTPUT);
-  pinMode(L298N_in4, OUTPUT);
+  pinMode(ENA_L, OUTPUT);
+  pinMode(IN1_L, OUTPUT);
+  pinMode(IN2_L, OUTPUT);
+  pinMode(ENA_R, OUTPUT);
+  pinMode(IN1_R, OUTPUT);
+  pinMode(IN2_R, OUTPUT);
 
-  // Set Motor Rotation Direction
-  digitalWrite(L298N_in1, HIGH);
-  digitalWrite(L298N_in2, LOW);
-  digitalWrite(L298N_in3, HIGH);
-  digitalWrite(L298N_in4, LOW);
+  pinMode(ENC_A_L, INPUT_PULLUP);
+  pinMode(ENC_B_L, INPUT_PULLUP);
+  pinMode(ENC_A_R, INPUT_PULLUP);
+  pinMode(ENC_B_R, INPUT_PULLUP);
 
-  rightMotor.SetMode(AUTOMATIC);
-  leftMotor.SetMode(AUTOMATIC);
-
-  // Configure LEDC PWM for motor enable pins
-  const int pwmFreq = 500; // 500Hz
-  const int pwmResolution = 8; // 8-bit (0-255)
-  // Channel 0 -> Right motor (L298N_enA)
-  // Channel 1 -> Left motor  (L298N_enB)
-  ledcSetup(0, pwmFreq, pwmResolution);
-  ledcAttachPin(L298N_enA, 0);
-  ledcSetup(1, pwmFreq, pwmResolution);
-  ledcAttachPin(L298N_enB, 1);
-
-  // Init encoders
-  pinMode(right_encoder_phaseB, INPUT);
-  pinMode(left_encoder_phaseB, INPUT);
-  // Set Callback for Wheel Encoders Pulse
-  attachInterrupt(digitalPinToInterrupt(right_encoder_phaseA),
-                  rightEncoderCallback, RISING);
-  attachInterrupt(digitalPinToInterrupt(left_encoder_phaseA),
-                  leftEncoderCallback, RISING);
-
+  attachInterrupt(digitalPinToInterrupt(ENC_A_L), isrLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_R), isrRight, RISING);
   Serial.begin(COM_RATE);
-  delay(2000);
 
   // Initialize micro-ROS serial transport
   set_microros_serial_transports(Serial);
-  delay(2000); // wait for agent
-
+  // delay(2000); // wait for agent
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL); // loop task
 
-  // wait for agent
   while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
     delay(1000);
     esp_task_wdt_reset();
   }
+
+  // wait for agent
 
   Wire.begin(SDA_PIN, SCL_PIN);
   if (!imu.begin()) {
@@ -277,7 +280,7 @@ void setup() {
   // Allocator & support
   rcl_allocator_t allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
-
+  esp_task_wdt_reset();
   // Create node
   rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
 
@@ -293,32 +296,37 @@ void setup() {
   imu_msg.data.size = 6;
   imu_msg.data.data = (float *)malloc(6 * sizeof(float));
 
-  const uint64_t timer_period_ns = RCL_MS_TO_NS(20);
-  rclc_timer_init_default2(&imu_timer, &support, timer_period_ns,
-                           imu_timer_callback, true);
+  rclc_timer_init_default2(&imu_timer, &support,
+                           RCL_MS_TO_NS(IMU_UPDATE_RATE_MS), imu_timer_callback,
+                           true);
 
   rclc_timer_init_default2(&agent_alive_timer, &support,
                            RCL_MS_TO_NS(AGENT_ALIVE_CHECK_MS),
                            agent_alive_timer_callback, true);
   rclc_timer_init_default2(&motor_timer, &support,
-                           RCL_MS_TO_NS(MOTOR_CONTROL_MS), motor_timer_callback,
-                           true);
-
+                           RCL_MS_TO_NS(MOTOR_CONTROL_RATE_MS),
+                           motor_timer_callback, true);
+  esp_task_wdt_reset();
   rclc_executor_init(&executor, &support.context, 4, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
   rclc_executor_add_timer(&executor, &motor_timer);
 
   // cmd_vel subscriber
-  rclc_subscription_init_default(&cmd_vel_sub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
-  rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
+  rclc_subscription_init_default(
+      &cmd_vel_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+  rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
+                                 &cmd_vel_callback, ON_NEW_DATA);
 
   RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node started");
+  esp_task_wdt_reset();
 }
 
 // ---------------- Arduino loop ----------------
 void loop() {
-  if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)) != RCL_RET_OK) {
+  if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(EXECUTOR_SPIN_RATE_MS)) !=
+      RCL_RET_OK) {
     delay(1);
   }
 
@@ -329,22 +337,35 @@ void loop() {
   }
 }
 
-// New pulse from Right Wheel Encoder
-void rightEncoderCallback() {
-  if (digitalRead(right_encoder_phaseB) == HIGH) {
-    right_wheel_sign = wheel_sign_t::POSITIVE;
+// ===================== Motor helpers =====================
+void setDir(float v, int in1, int in2) {
+  if (v >= 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
   } else {
-    right_wheel_sign = wheel_sign_t::NEGATIVE;
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
   }
-  right_encoder_counter++;
 }
 
-// New pulse from Left Wheel Encoder
-void leftEncoderCallback() {
-  if (digitalRead(left_encoder_phaseB) == HIGH) {
-    left_wheel_sign = wheel_sign_t::POSITIVE;
-  } else {
-    left_wheel_sign = wheel_sign_t::NEGATIVE;
+void brakeMotor(int in1, int in2) {
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, HIGH);
+}
+
+int motorPI(float target_rpm, float actual_rpm, float &integral, float dt) {
+  if (fabs(target_rpm) < 0.01f) {
+    integral = 0;
+    return 0;
   }
-  left_encoder_counter++;
+
+  float error = target_rpm - actual_rpm;
+  integral += error * dt;
+  integral = constrain(integral, -50, 50);
+
+  float u = Kp * error + Ki * integral;
+  int pwm = abs((int)u);
+
+  if (pwm < PWM_DEADBAND) pwm = 0;
+  return constrain(pwm, 0, PWM_MAX);
 }
