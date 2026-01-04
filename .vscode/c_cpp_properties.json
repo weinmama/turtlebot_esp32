@@ -502,7 +502,7 @@
                 "PLATFORMIO=60118",
                 "ARDUINO_ESP32_DEV",
                 "MICRO_ROS_TRANSPORT_SERIAL",
-                "ARDUINO_ARCH_ESP32",
+                "ARDUINO_ARCH_ESP32ls",
                 "HAVE_CONFIG_H",
                 "MBEDTLS_CONFIG_FILE=\"mbedtls/esp_config.h\"",
                 "UNITY_INCLUDE_CONFIG_H",

@@ -10,7 +10,7 @@
 #include <rcutils/logging_macros.h>
 #include <rmw_microros/rmw_microros.h>
 
-#include <geometry_msgs/msg/twist.h>
+#include <geometry_msgs/msg/twist_stamped.h>
 #include <rcl_interfaces/msg/log.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <std_msgs/msg/string.h>
@@ -81,12 +81,13 @@ const float WHEEL_CIRC = 2 * PI * WHEEL_RADIUS;
 const int PULSES_PER_REV = 614;
 
 /************** L298 **************/
-const int PWM_DEADBAND = 60;
+const int PWM_DEADBAND = 150;
 const int PWM_MAX = 255;
 
 /************** Ramps **************/
 const float A_MAX = 0.5;     // m/s²
 const float ALPHA_MAX = 2.0; // rad/s²
+
 
 /************** Control **************/
 static float v_cmd = 0.0; // velocity [m/s]
@@ -95,8 +96,11 @@ static float w_cmd = 0.0; // angular velocity [rad/s]
 static float v = 0.0; // ramped velocity
 static float w = 0.0;
 
-float Kp = 2.1;
-float Ki = 0.6;
+float Kp_L = 2.0;
+float Ki_L = 0.6;
+float Kp_R = 2.0;
+float Ki_R = 0.6;
+
 
 const float MIN_SPEED_X = 0.01;
 const float MIN_ANGULAR_SPEED_Z = 0.0001;
@@ -114,7 +118,7 @@ float x = 0.0, y = 0.0, theta = 0.0;
 
 // cmd_vel subscriber
 rcl_subscription_t cmd_vel_sub;
-geometry_msgs__msg__Twist cmd_vel_msg;
+geometry_msgs__msg__TwistStamped cmd_vel_msg;
 void cmd_vel_callback(const void *msgin);
 
 // Alive check
@@ -125,7 +129,7 @@ std_msgs__msg__Float32MultiArray imu_msg;
 rcl_interfaces__msg__Log log_msg;
 
 // forward declarations - Motor helpers
-int motorPI(float target_rpm, float actual_rpm, float &integral, float dt);
+int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float Kp, float Ki);
 void setDir(float v, int in1, int in2);
 void brakeMotor(int in1, int in2);
 
@@ -167,6 +171,7 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 static int64_t last_time_ns = 0;
 
 void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+  
   if (timer == NULL)
     return;
 
@@ -215,7 +220,7 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     int_L = 0;
   } else {
     setDir(vL, IN1_L, IN2_L);
-    int pwm = motorPI(rpmL_target, rpmL, int_L, dt);
+    int pwm = motorPI(rpmL_target, rpmL, int_L, dt, Kp_L, Ki_L);
     analogWrite(ENA_L, pwm);
   }
 
@@ -225,16 +230,16 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     int_R = 0;
   } else {
     setDir(vR, IN1_R, IN2_R);
-    int pwm = motorPI(rpmR_target, rpmR, int_R, dt);
+    int pwm = motorPI(rpmR_target, rpmR, int_R, dt, Kp_R, Ki_R);
     analogWrite(ENA_R, pwm);
   }
 }
 
 void cmd_vel_callback(const void *msgin) {
-  const geometry_msgs__msg__Twist *msg =
-      (const geometry_msgs__msg__Twist *)msgin;
-  v_cmd = fabs(msg->linear.x) < MIN_SPEED_X ? 0.0f : msg->linear.x;
-  w_cmd = fabs(msg->angular.z) < MIN_ANGULAR_SPEED_Z ? 0.0f : msg->angular.z;
+  const geometry_msgs__msg__TwistStamped *msg =
+      (const geometry_msgs__msg__TwistStamped *)msgin;
+  v_cmd = fabs(msg->twist.linear.x) < MIN_SPEED_X ? 0.0f : msg->twist.linear.x;
+  w_cmd = fabs(msg->twist.angular.z) < MIN_ANGULAR_SPEED_Z ? 0.0f : -msg->twist.angular.z;
 }
 
 // ---------------- Arduino setup ----------------
@@ -317,7 +322,7 @@ void setup() {
   // cmd_vel subscriber
   rclc_subscription_init_default(
       &cmd_vel_sub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped), "cmd_vel");
   rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
                                  &cmd_vel_callback, ON_NEW_DATA);
 
@@ -328,6 +333,7 @@ void setup() {
 // ---------------- Arduino loop ----------------
 void loop() {
   if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(EXECUTOR_SPIN_RATE_MS)) !=
+
       RCL_RET_OK) {
     delay(1);
   }
@@ -355,7 +361,7 @@ void brakeMotor(int in1, int in2) {
   digitalWrite(in2, HIGH);
 }
 
-int motorPI(float target_rpm, float actual_rpm, float &integral, float dt) {
+int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float Kp, float Ki) {
   if (fabs(target_rpm) < 0.01f) {
     integral = 0;
     return 0;
