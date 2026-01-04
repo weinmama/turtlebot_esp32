@@ -81,7 +81,7 @@ const float WHEEL_CIRC = 2 * PI * WHEEL_RADIUS;
 const int PULSES_PER_REV = 614;
 
 /************** L298 **************/
-const int PWM_DEADBAND = 150;
+const int PWM_DEADBAND = 0;
 const int PWM_MAX = 255;
 
 /************** Ramps **************/
@@ -96,8 +96,8 @@ static float w_cmd = 0.0; // angular velocity [rad/s]
 static float v = 0.0; // ramped velocity
 static float w = 0.0;
 
-float Kp_L = 2.0;
-float Ki_L = 0.6;
+float Kp_L = 3.0;
+float Ki_L = 4.6;
 float Kp_R = 2.0;
 float Ki_R = 0.6;
 
@@ -366,14 +366,18 @@ int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float
     integral = 0;
     return 0;
   }
+  
+  // // Deadband auf TARGET-Geschwindigkeit!
+  // if (fabs(target_rpm) < 20.0f) {  // 10 RPM = ~0.02 m/s
+  //   integral = 0;
+  //   return 0;
+  // }
 
   float error = target_rpm - actual_rpm;
   integral += error * dt;
   integral = constrain(integral, -50, 50);
-
+  
   float u = Kp * error + Ki * integral;
   int pwm = abs((int)u);
-
-  if (pwm < PWM_DEADBAND) pwm = 0;
-  return constrain(pwm, 0, PWM_MAX);
+  return constrain(pwm, PWM_DEADBAND, PWM_MAX);  // Mindestens Deadband
 }
