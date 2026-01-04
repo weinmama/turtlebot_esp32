@@ -25,6 +25,7 @@
 #define EXECUTOR_SPIN_RATE_MS 5    // Milliseconds
 #define IMU_UPDATE_RATE_MS 20      // Milliseconds
 #define COM_RATE 115200
+#define ROS_DOMAIN_ID 1
 
 // L298N H-Bridge Connection PINs
 #define L298N_enB 14 // PWM
@@ -277,7 +278,12 @@ void setup() {
 
   // Allocator & support
   rcl_allocator_t allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
+
+  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+  rcl_init_options_init(&init_options, allocator);
+  rcl_init_options_set_domain_id(&init_options, ROS_DOMAIN_ID);  // Dein Domain ID
+  rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
+
   // Create node
   rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
 
