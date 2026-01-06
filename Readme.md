@@ -55,19 +55,6 @@ ssh robot-pi "
 "
 ```
 
-// L298N H-Bridge Connection PINs
-#define L298N_enB 25  // PWM
-#define L298N_enA 14  // PWM
-#define L298N_in2 32  // Dir Motor B
-#define L298N_in1 33  // Dir Motor B
-#define L298N_in4 27  // Dir Motor A
-#define L298N_in3 26  // Dir Motor A
+Tests
 
-// Wheel Encoders Connection PINs
-#define right_encoder_phaseA 23  // Interrupt
-#define right_encoder_phaseB 15
-#define left_encoder_phaseA 18   // Interrupt
-#define left_encoder_phaseB 13
-
-#define SCL 22
-#define SDA 21
+ros2 topic pub /cmd_vel geometry_msgs/msg/TwistStamped "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: 'base_link'}, twist: {linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}}"

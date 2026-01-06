@@ -97,7 +97,6 @@ const int PWM_MAX = 255;
 const float A_MAX = 0.5;     // m/s²
 const float ALPHA_MAX = 2.0; // rad/s²
 
-
 /************** Control **************/
 static float v_cmd = 0.0; // velocity [m/s]
 static float w_cmd = 0.0; // angular velocity [rad/s]
@@ -109,7 +108,6 @@ float Kp_L = 1.7;
 float Ki_L = 0.5;
 float Kp_R = 1.7;
 float Ki_R = 0.5;
-
 
 const float MIN_SPEED_X = 0.01;
 const float MIN_ANGULAR_SPEED_Z = 0.0001;
@@ -222,6 +220,7 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   float rpmL = (dsL / WHEEL_CIRC) / dt * 60.0f;
   float rpmR = (dsR / WHEEL_CIRC) / dt * 60.0f;
 
+  rpmL = rpmR = 120.0f;
   // -------- Control --------
   if (vL == 0.0f) {
     motor_left.brake();
