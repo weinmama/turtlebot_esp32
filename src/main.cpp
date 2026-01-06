@@ -15,7 +15,9 @@
 #include <std_msgs/msg/float32_multi_array.h>
 #include <std_msgs/msg/string.h>
 
+#include <TB6612_ESP32.h>
 #include "esp_task_wdt.h"
+
 
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
@@ -27,13 +29,14 @@
 #define COM_RATE 115200
 #define ROS_DOMAIN_ID 1
 
-// L298N H-Bridge Connection PINs
-#define L298N_enB 14 // PWM
-#define L298N_enA 27 // PWM
-#define L298N_in2 25 // Dir Motor B
-#define L298N_in1 26 // Dir Motor B
-#define L298N_in4 32 // Dir Motor A
-#define L298N_in3 33 // Dir Motor A
+// TB6012FNG H-Bridge Connection PINs
+#define AIN1 26  // Motor A direction pin 1
+#define AIN2 25  // Motor A direction pin 2
+#define PWMA 27  // Motor A PWM speed control
+#define BIN1 33  // Motor B direction pin 1
+#define BIN2 32  // Motor B direction pin 2
+#define PWMB 14  // Motor B PWM speed control
+#define STBY 12  // Standby pin (must be HIGH to enable motors)
 
 // Wheel Encoders Connection PINs
 #define right_encoder_phaseA 19 // Interrupt
@@ -79,6 +82,12 @@ const float WHEEL_RADIUS = 0.034; // m
 const float WHEEL_BASE = 0.20;    // m
 const float WHEEL_CIRC = 2 * PI * WHEEL_RADIUS;
 const int PULSES_PER_REV = 614;
+// Motor-Objekte für TB6012FNG (Offset für Motor Direction)
+const int offsetA = -1;  // Invertiert für Motor rechts
+const int offsetB = -1;  // Invertiert für Motor links
+// Motor(In1pin, In2pin, PWMpin, offset, STBYpin, freq, resolution, channel_pin)
+Motor motor_right= Motor(AIN1, AIN2, PWMA, offsetA, STBY, 5000, 8, 1);
+Motor motor_left = Motor(BIN1, BIN2, PWMB, offsetB, STBY, 5000, 8, 2);
 
 /************** L298 **************/
 const int PWM_DEADBAND = 0;
@@ -96,10 +105,10 @@ static float w_cmd = 0.0; // angular velocity [rad/s]
 static float v = 0.0; // ramped velocity
 static float w = 0.0;
 
-float Kp_L = 3.0;
-float Ki_L = 4.6;
-float Kp_R = 2.0;
-float Ki_R = 0.6;
+float Kp_L = 1.7;
+float Ki_L = 0.5;
+float Kp_R = 1.7;
+float Ki_R = 0.5;
 
 
 const float MIN_SPEED_X = 0.01;
@@ -215,23 +224,19 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
   // -------- Control --------
   if (vL == 0.0f) {
-    brakeMotor(IN1_L, IN2_L);
-    analogWrite(ENA_L, 0);
+    motor_left.brake();
     int_L = 0;
   } else {
-    setDir(vL, IN1_L, IN2_L);
     int pwm = motorPI(rpmL_target, rpmL, int_L, dt, Kp_L, Ki_L);
-    analogWrite(ENA_L, pwm);
+    motor_left.drive(pwm);
   }
 
   if (vR == 0.0f) {
-    brakeMotor(IN1_R, IN2_R);
-    analogWrite(ENA_R, 0);
+    motor_right.brake();
     int_R = 0;
   } else {
-    setDir(vR, IN1_R, IN2_R);
     int pwm = motorPI(rpmR_target, rpmR, int_R, dt, Kp_R, Ki_R);
-    analogWrite(ENA_R, pwm);
+    motor_right.drive(pwm);
   }
 }
 
@@ -245,12 +250,9 @@ void cmd_vel_callback(const void *msgin) {
 // ---------------- Arduino setup ----------------
 void setup() {
 
-  pinMode(ENA_L, OUTPUT);
-  pinMode(IN1_L, OUTPUT);
-  pinMode(IN2_L, OUTPUT);
-  pinMode(ENA_R, OUTPUT);
-  pinMode(IN1_R, OUTPUT);
-  pinMode(IN2_R, OUTPUT);
+  // activate standby
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
 
   pinMode(ENC_A_L, INPUT_PULLUP);
   pinMode(ENC_B_L, INPUT_PULLUP);
@@ -263,16 +265,17 @@ void setup() {
 
   // Initialize micro-ROS serial transport
   set_microros_serial_transports(Serial);
-  // delay(2000); // wait for agent
- 
+  
+  // wait for agent
   while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
     delay(1000);
   }
 
-  // wait for agent
+  // start watchdog
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL); 
   
+  // try to initialize IMU
   Wire.begin(SDA_PIN, SCL_PIN);
   if (!imu.begin()) {
     RCUTILS_LOG_ERROR("Failed to find MPU6050 chip");
@@ -280,19 +283,20 @@ void setup() {
       delay(10);
     }
   }
+  
+    //Reset Watchdog to be save - don't know if it helps
+  esp_task_wdt_reset();
 
   // Allocator & support
   rcl_allocator_t allocator = rcl_get_default_allocator();
 
   rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
   rcl_init_options_init(&init_options, allocator);
-  rcl_init_options_set_domain_id(&init_options, ROS_DOMAIN_ID);  // Dein Domain ID
+  rcl_init_options_set_domain_id(&init_options, ROS_DOMAIN_ID);  
   rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
 
   // Create node
   rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
-
-  RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node initialized.");
 
   // IMU publisher
   rclc_publisher_init_default(
@@ -314,6 +318,10 @@ void setup() {
   rclc_timer_init_default2(&motor_timer, &support,
                            RCL_MS_TO_NS(MOTOR_CONTROL_RATE_MS),
                            motor_timer_callback, true);
+
+  //Reset Watchdog to be save - don't know if it helps
+  esp_task_wdt_reset();
+
   rclc_executor_init(&executor, &support.context, 4, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
@@ -325,8 +333,6 @@ void setup() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped), "cmd_vel");
   rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
                                  &cmd_vel_callback, ON_NEW_DATA);
-
-  RCUTILS_LOG_INFO(node.get_logger(), "Turtlebot LowLevel Node started");
 
 }
 
@@ -345,33 +351,12 @@ void loop() {
   }
 }
 
-// ===================== Motor helpers =====================
-void setDir(float v, int in1, int in2) {
-  if (v >= 0) {
-    digitalWrite(in1, HIGH);
-    digitalWrite(in2, LOW);
-  } else {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, HIGH);
-  }
-}
-
-void brakeMotor(int in1, int in2) {
-  digitalWrite(in1, HIGH);
-  digitalWrite(in2, HIGH);
-}
-
+// // ===================== Motor helpers =====================
 int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float Kp, float Ki) {
   if (fabs(target_rpm) < 0.01f) {
     integral = 0;
     return 0;
   }
-  
-  // // Deadband auf TARGET-Geschwindigkeit!
-  // if (fabs(target_rpm) < 20.0f) {  // 10 RPM = ~0.02 m/s
-  //   integral = 0;
-  //   return 0;
-  // }
 
   float error = target_rpm - actual_rpm;
   integral += error * dt;
@@ -379,5 +364,5 @@ int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float
   
   float u = Kp * error + Ki * integral;
   int pwm = abs((int)u);
-  return constrain(pwm, PWM_DEADBAND, PWM_MAX);  // Mindestens Deadband
+  return constrain(pwm, PWM_DEADBAND, PWM_MAX); 
 }
