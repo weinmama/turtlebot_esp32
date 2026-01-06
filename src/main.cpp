@@ -353,6 +353,11 @@ int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float
   integral = constrain(integral, -50, 50);
   
   float u = Kp * error + Ki * integral;
-  int pwm = abs((int)u);
-  return constrain(pwm, PWM_DEADBAND, PWM_MAX); 
+  int pwm = (int)u;
+  
+  if (pwm > 0) {
+    return constrain(pwm, PWM_DEADBAND, PWM_MAX);
+  } else {
+    return constrain(pwm, -PWM_MAX, -PWM_DEADBAND);
+  } 
 }
