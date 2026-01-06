@@ -46,16 +46,10 @@
 
 /************** Pins **************/
 // left wheel
-#define ENA_L 27
-#define IN1_L 33
-#define IN2_L 32
 #define ENC_A_L 5
 #define ENC_B_L 17
 
 // right wheel
-#define ENA_R 14
-#define IN1_R 26
-#define IN2_R 25
 #define ENC_A_R 19
 #define ENC_B_R 18
 
@@ -106,8 +100,8 @@ static float w = 0.0;
 
 float Kp_L = 1.7;
 float Ki_L = 0.5;
-float Kp_R = 1.7;
-float Ki_R = 0.5;
+float Kp_R = Kp_L;
+float Ki_R = Ki_L;
 
 const float MIN_SPEED_X = 0.01;
 const float MIN_ANGULAR_SPEED_Z = 0.0001;
@@ -137,13 +131,11 @@ rcl_interfaces__msg__Log log_msg;
 
 // forward declarations - Motor helpers
 int motorPI(float target_rpm, float actual_rpm, float &integral, float dt, float Kp, float Ki);
-void setDir(float v, int in1, int in2);
-void brakeMotor(int in1, int in2);
 
 // ===== Encoder ISRs =====
 
 void isrLeft() { ticks_L += (digitalRead(ENC_B_L) == HIGH) ? 1 : -1; }
-void isrRight() { ticks_R -= (digitalRead(ENC_B_R) == HIGH) ? 1 : -1; }
+void isrRight() { ticks_R += (digitalRead(ENC_B_R) == HIGH) ? 1 : -1; }
 
 // ===== Timer callback (50 Hz) =====
 void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
@@ -220,7 +212,6 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   float rpmL = (dsL / WHEEL_CIRC) / dt * 60.0f;
   float rpmR = (dsR / WHEEL_CIRC) / dt * 60.0f;
 
-  rpmL = rpmR = 120.0f;
   // -------- Control --------
   if (vL == 0.0f) {
     motor_left.brake();
