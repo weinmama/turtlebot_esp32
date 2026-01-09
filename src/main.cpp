@@ -7,11 +7,12 @@
 #include <rcl/rcl.h>
 #include <rclc/executor.h>
 #include <rclc/rclc.h>
-#include <rclc_parameter/rclc_parameter.h>
 #include <rcutils/logging_macros.h>
 #include <rmw_microros/rmw_microros.h>
 
 #include <geometry_msgs/msg/twist_stamped.h>
+#include <geometry_msgs/msg/transform_stamped.h>
+#include <nav_msgs/msg/odometry.h>
 #include <rcl_interfaces/msg/log.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <std_msgs/msg/string.h>
@@ -68,10 +69,10 @@ rcl_timer_t imu_timer;
 rcl_timer_t agent_alive_timer;
 rcl_timer_t motor_timer;
 rclc_executor_t executor;
-rclc_parameter_server_t param_server;
 
 rcl_publisher_t rosout_pub;
 rcl_publisher_t imu_pub;
+rcl_publisher_t odom_pub;
 bool rosout_pub_initialized = false;
 
 /************** Robot Parameter **************/
@@ -101,8 +102,8 @@ static float w_cmd = 0.0; // angular velocity [rad/s]
 static float v = 0.0; // ramped velocity
 static float w = 0.0;
 
-float Kp_L = 5.8;
-float Ki_L = 2.9;
+float Kp_L = 3.8;
+float Ki_L = 1.9;
 float Kd_L = 0.04;
 float Kp_R = Kp_L;
 float Ki_R = Ki_L;
@@ -126,11 +127,17 @@ float p_term_R = 0, i_term_R = 0, d_term_R = 0;
 
 /************** Odometry **************/ 
 float x = 0.0, y = 0.0, theta = 0.0;
+float v_odom = 0.0, w_odom = 0.0; // velocities for odometry message
 
 // cmd_vel subscriber
 rcl_subscription_t cmd_vel_sub;
 geometry_msgs__msg__TwistStamped cmd_vel_msg;
 void cmd_vel_callback(const void *msgin);
+
+// PID tuning subscriber (array: [Kp_L, Ki_L, Kd_L, Kp_R, Ki_R, Kd_R])
+rcl_subscription_t pid_tune_sub;
+std_msgs__msg__Float32MultiArray pid_tune_msg;
+void pid_tune_callback(const void *msgin);
 
 // Alive check
 static int64_t last_agent_ok_ms = 0;
@@ -138,6 +145,7 @@ static int64_t last_agent_ok_ms = 0;
 // -------------------- Messages --------------------
 std_msgs__msg__Float32MultiArray imu_msg;
 rcl_interfaces__msg__Log log_msg;
+nav_msgs__msg__Odometry odom_msg;
 
 // -------------------- Logging Helpers --------------------
 void log_message(uint8_t level, const char* name, const char* msg) {
@@ -225,36 +233,27 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
   if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
     last_agent_ok_ms = now_ms();
-    esp_task_wdt_reset();
   }
-
-  
-  // // Sync parameters from parameter server (only every 1 second to avoid blocking)
-  // static unsigned long last_param_sync = 0;
-  // unsigned long now = millis();
-  // if (now - last_param_sync >= 1000) {
-  //   double kp_l_val, ki_l_val, kd_l_val, kp_r_val, ki_r_val, kd_r_val;
-  //   if (rclc_parameter_get_double(&param_server, "Kp_L", &kp_l_val) == RCL_RET_OK) {
-  //     Kp_L = (float)kp_l_val;
-  //   }
-  //   if (rclc_parameter_get_double(&param_server, "Ki_L", &ki_l_val) == RCL_RET_OK) {
-  //     Ki_L = (float)ki_l_val;
-  //   }
-  //   if (rclc_parameter_get_double(&param_server, "Kd_L", &kd_l_val) == RCL_RET_OK) {
-  //     Kd_L = (float)kd_l_val;
-  //   }
-  //   if (rclc_parameter_get_double(&param_server, "Kp_R", &kp_r_val) == RCL_RET_OK) {
-  //     Kp_R = (float)kp_r_val;
-  //   }
-  //   if (rclc_parameter_get_double(&param_server, "Ki_R", &ki_r_val) == RCL_RET_OK) {
-  //     Ki_R = (float)ki_r_val;
-  //   }
-  //   if (rclc_parameter_get_double(&param_server, "Kd_R", &kd_r_val) == RCL_RET_OK) {
-  //     Kd_R = (float)kd_r_val;
-  //   }
-  //   last_param_sync = now;
-  // }
 }
+
+// PID tuning callback - receives array [Kp_L, Ki_L, Kd_L, Kp_R, Ki_R, Kd_R]
+void pid_tune_callback(const void *msgin) {
+  const std_msgs__msg__Float32MultiArray *msg = (const std_msgs__msg__Float32MultiArray *)msgin;
+  
+  if (msg->data.size >= 6) {
+    Kp_L = msg->data.data[0];
+    Ki_L = msg->data.data[1];
+    Kd_L = msg->data.data[2];
+    Kp_R = msg->data.data[3];
+    Ki_R = msg->data.data[4];
+    Kd_R = msg->data.data[5];
+    
+    char log_buf[100];
+    snprintf(log_buf, sizeof(log_buf), "PID updated: Kp=%.2f Ki=%.2f Kd=%.2f", Kp_L, Ki_L, Kd_L);
+    log_info(log_buf);
+  }
+}
+
 static int64_t last_time_ns = 0;
 
 void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
@@ -268,9 +267,11 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (dt <= 0.0f || dt > 0.5f)
     return;
 
+    v = v_cmd;
+    w = w_cmd;
   // -------- Ramp --------
-  v += constrain(v_cmd - v, -A_MAX * dt, A_MAX * dt);
-  w += constrain(w_cmd - w, -ALPHA_MAX * dt, ALPHA_MAX * dt);
+ // v += constrain(v_cmd - v, -A_MAX * dt, A_MAX * dt);
+ // w += constrain(w_cmd - w, -ALPHA_MAX * dt, ALPHA_MAX * dt);
 
   // -------- Diff Drive --------
   float vL = v - w * WHEEL_BASE / 2.0f;
@@ -295,6 +296,42 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   x += ds * cos(theta + dtheta * 0.5f);
   y += ds * sin(theta + dtheta * 0.5f);
   theta += dtheta;
+  
+  // Calculate velocities for odometry message
+  v_odom = ds / dt;
+  w_odom = dtheta / dt;
+  
+  // -------- Publish Odometry --------
+  // Get current time in nanoseconds
+  int64_t time_ns = rmw_uros_epoch_nanos();
+  
+  // Populate odometry message
+  odom_msg.header.stamp.sec = time_ns / 1000000000;
+  odom_msg.header.stamp.nanosec = time_ns % 1000000000;
+  
+  // Position
+  odom_msg.pose.pose.position.x = x;
+  odom_msg.pose.pose.position.y = y;
+  odom_msg.pose.pose.position.z = 0.0;
+  
+  // Orientation (quaternion from theta)
+  float half_theta = theta * 0.5f;
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sin(half_theta);
+  odom_msg.pose.pose.orientation.w = cos(half_theta);
+  
+  // Velocity in robot frame
+  odom_msg.twist.twist.linear.x = v_odom;
+  odom_msg.twist.twist.linear.y = 0.0;
+  odom_msg.twist.twist.linear.z = 0.0;
+  odom_msg.twist.twist.angular.x = 0.0;
+  odom_msg.twist.twist.angular.y = 0.0;
+  odom_msg.twist.twist.angular.z = w_odom;
+  
+  // Publish odometry
+  rcl_ret_t odom_ret = rcl_publish(&odom_pub, &odom_msg, NULL);
+  (void)odom_ret; // Suppress unused warning
 
   // -------- RPM --------
   float rpmL = (dsL / WHEEL_CIRC) / dt * 60.0f;
@@ -442,6 +479,28 @@ void setup() {
   imu_msg.data.data = (float *)malloc(6 * sizeof(float));
   
   log_info("IMU publisher initialized");
+  
+  // Odometry publisher
+  rclc_publisher_init_default(
+      &odom_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+      "odom");
+  
+  // Initialize odometry message
+  nav_msgs__msg__Odometry__init(&odom_msg);
+  
+  // Set frame IDs (manually allocate and copy strings)
+  odom_msg.header.frame_id.data = (char*)malloc(5);
+  strcpy(odom_msg.header.frame_id.data, "odom");
+  odom_msg.header.frame_id.size = 4;
+  odom_msg.header.frame_id.capacity = 5;
+  
+  odom_msg.child_frame_id.data = (char*)malloc(19);
+  strcpy(odom_msg.child_frame_id.data, "base_footprint");
+  odom_msg.child_frame_id.size = 14;
+  odom_msg.child_frame_id.capacity = 19;
+  
+  log_info("Odometry publisher initialized");
 
   rclc_timer_init_default2(&imu_timer, &support,
                            RCL_MS_TO_NS(IMU_UPDATE_RATE_MS), imu_timer_callback,
@@ -457,36 +516,15 @@ void setup() {
   //Reset Watchdog to be save - don't know if it helps
   esp_task_wdt_reset();
 
-  // Initialize parameter server (6 parameters: Kp_L, Ki_L, Kd_L, Kp_R, Ki_R, Kd_R)
-  rclc_parameter_server_init_default(&param_server, &node);
-  esp_task_wdt_reset();
-  
-  // Add PID parameters
-  rclc_add_parameter(&param_server, "Kp_L", RCLC_PARAMETER_DOUBLE);
-  rclc_add_parameter(&param_server, "Ki_L", RCLC_PARAMETER_DOUBLE);
-  rclc_add_parameter(&param_server, "Kd_L", RCLC_PARAMETER_DOUBLE);
-  esp_task_wdt_reset();
-  rclc_add_parameter(&param_server, "Kp_R", RCLC_PARAMETER_DOUBLE);
-  rclc_add_parameter(&param_server, "Ki_R", RCLC_PARAMETER_DOUBLE);
-  rclc_add_parameter(&param_server, "Kd_R", RCLC_PARAMETER_DOUBLE);
-  esp_task_wdt_reset();
-  
-  // Set initial parameter values
-  rclc_parameter_set_double(&param_server, "Kp_L", Kp_L);
-  rclc_parameter_set_double(&param_server, "Ki_L", Ki_L);
-  rclc_parameter_set_double(&param_server, "Kd_L", Kd_L);
-  rclc_parameter_set_double(&param_server, "Kp_R", Kp_R);
-  rclc_parameter_set_double(&param_server, "Ki_R", Ki_R);
-  rclc_parameter_set_double(&param_server, "Kd_R", Kd_R);
-  esp_task_wdt_reset();
-  
-  log_info("Parameter server initialized");
+  // Initialize PID tuning message
+  pid_tune_msg.data.capacity = 6;
+  pid_tune_msg.data.size = 0;
+  pid_tune_msg.data.data = (float *)malloc(6 * sizeof(float));
 
   rclc_executor_init(&executor, &support.context, 5, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
   rclc_executor_add_timer(&executor, &motor_timer);
-  rclc_executor_add_parameter_server(&executor, &param_server, NULL);
 
   // cmd_vel subscriber
   rclc_subscription_init_default(
@@ -494,6 +532,13 @@ void setup() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped), "cmd_vel");
   rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
                                  &cmd_vel_callback, ON_NEW_DATA);
+  
+  // PID tuning subscriber
+  rclc_subscription_init_default(
+      &pid_tune_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray), "pid_tune");
+  rclc_executor_add_subscription(&executor, &pid_tune_sub, &pid_tune_msg,
+                                 &pid_tune_callback, ON_NEW_DATA);
   
   log_info("System initialization complete");
   log_info("Ready to receive commands");
@@ -535,7 +580,7 @@ int motorPID(float target_rpm, float actual_rpm, float &integral, float &prev_er
     // Simple low-pass filter on derivative to reduce noise
     static float filtered_deriv_L = 0;
     static float filtered_deriv_R = 0;
-    float alpha = 0.5; // filter coefficient
+    float alpha = 0.8f; // filter coefficient
     if (&prev_error == &prev_error_L) {
       filtered_deriv_L = alpha * derivative + (1 - alpha) * filtered_deriv_L;
       derivative = filtered_deriv_L;
@@ -554,10 +599,10 @@ int motorPID(float target_rpm, float actual_rpm, float &integral, float &prev_er
   int pwm = (int)u;
   
   // Anti-windup: only integrate if not saturated
-  if ((pwm < PWM_MAX && pwm > -PWM_MAX) || (error * integral < 0)) {
-    integral += error * dt;
-    integral = constrain(integral, -100, 100);
-  }
+  // if ((pwm < PWM_MAX && pwm > -PWM_MAX) || (error * integral < 0)) {
+  //   integral += error * dt;
+  //   integral = constrain(integral, -100, 100);
+  // }
   
   // Store error for next iteration
   prev_error = error;
