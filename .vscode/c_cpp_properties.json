@@ -10,6 +10,7 @@
             "includePath": [
                 "/mnt/data/projects/turtlebot_lowlevel/include",
                 "/mnt/data/projects/turtlebot_lowlevel/src",
+                "/mnt/data/projects/turtlebot_lowlevel/lib/TB6612FNG_ESP32/src",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit MPU6050",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit Unified Sensor",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit BusIO",
@@ -216,7 +217,6 @@
                 "/home/matze/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/dio_qspi/include",
                 "/home/matze/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                 "/home/matze/.platformio/packages/framework-arduinoespressif32/variants/esp32",
-                "/mnt/data/projects/turtlebot_lowlevel/lib/TB6612FNG_ESP32/src",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit GFX Library",
                 "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit SSD1306",
                 "/home/matze/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
@@ -257,6 +257,7 @@
                 "path": [
                     "/mnt/data/projects/turtlebot_lowlevel/include",
                     "/mnt/data/projects/turtlebot_lowlevel/src",
+                    "/mnt/data/projects/turtlebot_lowlevel/lib/TB6612FNG_ESP32/src",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit MPU6050",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit Unified Sensor",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit BusIO",
@@ -463,7 +464,6 @@
                     "/home/matze/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/dio_qspi/include",
                     "/home/matze/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                     "/home/matze/.platformio/packages/framework-arduinoespressif32/variants/esp32",
-                    "/mnt/data/projects/turtlebot_lowlevel/lib/TB6612FNG_ESP32/src",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit GFX Library",
                     "/mnt/data/projects/turtlebot_lowlevel/.pio/libdeps/esp32/Adafruit SSD1306",
                     "/home/matze/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
