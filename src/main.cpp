@@ -116,6 +116,18 @@ const int PWM_MAX = 255;
 const float MAX_MOTOR_RPM = 100.0f;
 const float MAX_WHEEL_SPEED_MPS = (MAX_MOTOR_RPM / 60.0f) * WHEEL_CIRC;
 
+// Feedforward mapping + static friction compensation.
+// Increase MAX_MOTOR_RPM to your measured max wheel RPM at PWM_MAX.
+const float RPM_TO_PWM = (float)PWM_MAX / MAX_MOTOR_RPM;
+// Baseline PWM to overcome stiction (tune per wheel).
+const int PWM_STATIC_L = 45;
+const int PWM_STATIC_R = 45;
+
+// Slew-rate limit for wheel RPM targets to avoid a jump in velocity when
+// starting to move (especially with feedforward + static friction offset).
+// Units: wheel RPM per second.
+const float TARGET_RPM_RAMP_PER_S = 200.0f;
+
 static int64_t last_cmd_vel_ms = 0;
 static const int64_t CMD_VEL_TIMEOUT_MS = 500;
 
@@ -126,19 +138,21 @@ double left_measured_rpm = 0.0;
 double right_measured_rpm = 0.0;
 double left_cmd = 0.0;
 double right_cmd = 0.0;
+double left_target_rpm_req = 0.0;
+double right_target_rpm_req = 0.0;
 double left_target_rpm = 0.0;
 double right_target_rpm = 0.0;
 
 float left_direction_coeff = 1.0f;
 float right_direction_coeff = 1.0f;
 
-#define Kp_L 2.5f
-#define Ki_L 0.0f
-#define Kd_L 0.0f
+#define Kp_L 1.9f
+#define Ki_L 0.3f
+#define Kd_L 0.02f
 
-#define Kp_R 2.5f
-#define Ki_R 0.0f
-#define Kd_R 0.0f
+#define Kp_R 1.9f
+#define Ki_R 0.3f
+#define Kd_R 0.02f
 
 PID motor_left_pid(&left_measured_rpm, &left_cmd, &left_target_rpm, Kp_L, Ki_L,
                    Kd_L, DIRECT);
@@ -370,9 +384,39 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   const bool cmd_timed_out =
       (last_cmd_vel_ms != 0 &&
        (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
-  const bool targets_zero = ((fabs(left_target_rpm) < TARGET_RPM_EPS) &&
-                             (fabs(right_target_rpm) < TARGET_RPM_EPS));
+  const bool targets_zero = ((fabs(left_target_rpm_req) < TARGET_RPM_EPS) &&
+                             (fabs(right_target_rpm_req) < TARGET_RPM_EPS));
   const bool robot_stopped = cmd_timed_out || targets_zero;
+
+  // Slew-limit the actual PID setpoints towards the requested targets.
+  const float max_delta_rpm = TARGET_RPM_RAMP_PER_S * dt;
+  if (robot_stopped) {
+    left_target_rpm = 0.0;
+    right_target_rpm = 0.0;
+  } else {
+    double dl = left_target_rpm_req - left_target_rpm;
+    if (dl > (double)max_delta_rpm) {
+      dl = (double)max_delta_rpm;
+    } else if (dl < -(double)max_delta_rpm) {
+      dl = -(double)max_delta_rpm;
+    }
+    left_target_rpm += dl;
+
+    double dr = right_target_rpm_req - right_target_rpm;
+    if (dr > (double)max_delta_rpm) {
+      dr = (double)max_delta_rpm;
+    } else if (dr < -(double)max_delta_rpm) {
+      dr = -(double)max_delta_rpm;
+    }
+    right_target_rpm += dr;
+
+    if (left_target_rpm < 0.0) {
+      left_target_rpm = 0.0;
+    }
+    if (right_target_rpm < 0.0) {
+      right_target_rpm = 0.0;
+    }
+  }
 
   int pwm_l = 0;
   int pwm_r = 0;
@@ -401,10 +445,25 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     motor_left_pid.Compute();
     motor_right_pid.Compute();
 
-    pwm_l = (int)constrain((int)(left_cmd * left_direction_coeff), -PWM_MAX,
-                           PWM_MAX);
-    pwm_r = (int)constrain((int)(right_cmd * right_direction_coeff), -PWM_MAX,
-                           PWM_MAX);
+    const int sign_l = (left_direction_coeff >= 0.0f) ? 1 : -1;
+    const int sign_r = (right_direction_coeff >= 0.0f) ? 1 : -1;
+
+    int pwm_ff_l = (int)lround(fabs(left_target_rpm) * RPM_TO_PWM);
+    int pwm_ff_r = (int)lround(fabs(right_target_rpm) * RPM_TO_PWM);
+    pwm_ff_l = constrain(pwm_ff_l, 0, PWM_MAX);
+    pwm_ff_r = constrain(pwm_ff_r, 0, PWM_MAX);
+    if (pwm_ff_l > 0) {
+      pwm_ff_l = min(PWM_MAX, pwm_ff_l + PWM_STATIC_L);
+    }
+    if (pwm_ff_r > 0) {
+      pwm_ff_r = min(PWM_MAX, pwm_ff_r + PWM_STATIC_R);
+    }
+
+    const int pwm_mag_l = constrain(pwm_ff_l + (int)lround(left_cmd), 0, PWM_MAX);
+    const int pwm_mag_r = constrain(pwm_ff_r + (int)lround(right_cmd), 0, PWM_MAX);
+
+    pwm_l = sign_l * pwm_mag_l;
+    pwm_r = sign_r * pwm_mag_r;
     motor_left.drive(pwm_l);
     motor_right.drive(pwm_r);
   }
@@ -450,8 +509,8 @@ void cmd_vel_callback(const void *msgin) {
       (vL >= 0.0f) ? 1.0f : -1.0f; // Update direction coefficient
   right_direction_coeff = (vR >= 0.0f) ? 1.0f : -1.0f;
 
-  left_target_rpm = fabs(vL / WHEEL_CIRC * 60.0f);
-  right_target_rpm = fabs(vR / WHEEL_CIRC * 60.0f);
+  left_target_rpm_req = fabs(vL / WHEEL_CIRC * 60.0f);
+  right_target_rpm_req = fabs(vR / WHEEL_CIRC * 60.0f);
 
   last_cmd_vel_ms = now_ms();
 
@@ -485,6 +544,12 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(ENC_A_L), isrLeft, RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_A_R), isrRight, RISING);
+
+  // PID outputs are used as a signed correction term around a feedforward PWM.
+  motor_left_pid.SetOutputLimits(-PWM_MAX, PWM_MAX);
+  motor_right_pid.SetOutputLimits(-PWM_MAX, PWM_MAX);
+  motor_left_pid.SetSampleTime(MOTOR_CONTROL_RATE_MS);
+  motor_right_pid.SetSampleTime(MOTOR_CONTROL_RATE_MS);
 
   motor_left_pid.SetMode(AUTOMATIC);
   motor_right_pid.SetMode(AUTOMATIC);
