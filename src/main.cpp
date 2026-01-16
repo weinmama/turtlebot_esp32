@@ -32,7 +32,7 @@
 
 // High-rate /rosout logging from the motor control loop can stall the serial
 // transport and break timing. Enable only while tuning.
-#define MOTOR_DEBUG_LOGS 1
+#define MOTOR_DEBUG_LOGS 0
 #define MOTOR_DEBUG_LOG_PERIOD_MS 250
 
 // TB6012FNG H-Bridge Connection PINs
