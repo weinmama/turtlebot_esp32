@@ -92,7 +92,10 @@ volatile long ticks_R = 0;
 /************** Robot Parameter **************/
 const float WHEEL_RADIUS = 0.034f;
 const float WHEEL_BASE = 0.20f;
-const int PULSES_PER_REV = 614;
+
+#define PULSES_PER_MOTOR_REV 11.0f
+#define GEAR_RATIO 46.8f
+const float PULSES_PER_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO;
 const float WHEEL_CIRC = 2.0f * PI * WHEEL_RADIUS;
 
 // Maximum angular velocity safety limit
