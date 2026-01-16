@@ -17,7 +17,9 @@
 #include <std_msgs/msg/float32_multi_array.h>
 #include <std_msgs/msg/string.h>
 
+#include <esp_timer.h>
 #include "esp_task_wdt.h"
+#include <PID_v1.h>
 #include <TB6612_ESP32.h>
 
 // ---------------- Definitions ----------------
@@ -149,28 +151,33 @@ static float w = 0.0f;
 float x = 0.0f, y = 0.0f, theta = 0.0f;
 float v_odom = 0.0f, w_odom = 0.0f;
 
-// Aggressive PID gains for smooth curves - high Kp to reach target, Kd to dampen oscillations
-float Kp_L = 5.0f;
-float Ki_L = 1.2f;
-float Kd_L = 0.5f;
-float Kp_R = 5.0f;
-float Ki_R = 1.2f;
-float Kd_R = 0.5f;
+double left_measured_rpm = 0.0;
+double right_measured_rpm = 0.0;
+double left_cmd = 0.0;
+double right_cmd = 0.0;
+double left_target_rpm = 0.0;
+double right_target_rpm = 0.0;
 
-float int_L = 0.0f, prev_error_L = 0.0f;
-float p_term_L = 0.0f, i_term_L = 0.0f, d_term_L = 0.0f;
-float int_R = 0.0f, prev_error_R = 0.0f;
-float p_term_R = 0.0f, i_term_R = 0.0f, d_term_R = 0.0f;
+float left_direction_coeff = 1.0f;
+float right_direction_coeff = 1.0f;
 
-int64_t last_agent_ok_ms = 0;
+#define Kp_L 2.5f
+#define Ki_L 0.0f
+#define Kd_L 0.0f
+
+#define Kp_R 2.5f
+#define Ki_R 0.0f
+#define Kd_R 0.0f
+
+PID motor_left_pid(&left_measured_rpm, &left_cmd, &left_target_rpm, Kp_L, Ki_L,
+                   Kd_L, DIRECT);
+PID motor_right_pid(&right_measured_rpm, &right_cmd, &right_target_rpm, Kp_R,
+                    Ki_R, Kd_R, DIRECT);
 
 Motor motor_left(BIN1, BIN2, PWMB, -1, STBY, 20000, 8, 2);
 Motor motor_right(AIN1, AIN2, PWMA, -1, STBY, 20000, 8, 2);
 
-// forward declarations - Motor helpers
-int motorPID(float target_rpm, float actual_rpm, float &integral,
-             float &prev_error, float dt, float Kp, float Ki, float Kd,
-             float &p_term, float &i_term, float &d_term, int pwm_ff);
+int64_t last_agent_ok_ms = 0;
 
 void log_message(uint8_t level, const char *name, const char *msg) {
   if (!rosout_pub_initialized) {
@@ -272,31 +279,34 @@ void pid_tune_callback(const void *msgin) {
       (const std_msgs__msg__Float32MultiArray *)msgin;
 
   if (msg->data.size == 3) {
-    Kp_L = msg->data.data[0];
-    Ki_L = msg->data.data[1];
-    Kd_L = msg->data.data[2];
+    const double kp = msg->data.data[0];
+    const double ki = msg->data.data[1];
+    const double kd = msg->data.data[2];
+    motor_left_pid.SetTunings(kp, ki, kd);
+    motor_right_pid.SetTunings(kp, ki, kd);
 
-    Kp_R = Kp_L;
-    Ki_R = Ki_L;
-    Kd_R = Kd_L;
-    char log_buf[100];
-    snprintf(log_buf, sizeof(log_buf), "Left PID updated: Kp=%.2f Ki=%.2f Kd=%.2f",
-             Kp_L, Ki_L, Kd_L);
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf),
+             "PID updated (both): Kp=%.3f Ki=%.3f Kd=%.3f", kp, ki, kd);
     log_info(log_buf);
     return;
   }
 
   if (msg->data.size >= 6) {
-    Kp_L = msg->data.data[0];
-    Ki_L = msg->data.data[1];
-    Kd_L = msg->data.data[2];
-    Kp_R = msg->data.data[3];
-    Ki_R = msg->data.data[4];
-    Kd_R = msg->data.data[5];
+    const double kpL = msg->data.data[0];
+    const double kiL = msg->data.data[1];
+    const double kdL = msg->data.data[2];
+    const double kpR = msg->data.data[3];
+    const double kiR = msg->data.data[4];
+    const double kdR = msg->data.data[5];
 
-    char log_buf[100];
-    snprintf(log_buf, sizeof(log_buf), "PID updated: Kp=%.2f Ki=%.2f Kd=%.2f",
-             Kp_L, Ki_L, Kd_L);
+    motor_left_pid.SetTunings(kpL, kiL, kdL);
+    motor_right_pid.SetTunings(kpR, kiR, kdR);
+
+    char log_buf[192];
+    snprintf(log_buf, sizeof(log_buf),
+             "PID updated: L(Kp=%.3f Ki=%.3f Kd=%.3f) R(Kp=%.3f Ki=%.3f Kd=%.3f)",
+             kpL, kiL, kdL, kpR, kiR, kdR);
     log_info(log_buf);
   }
 }
@@ -323,34 +333,6 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (dt <= 0.0f || dt > 0.5f) {
     return;
   }
-
-  v = v_cmd;
-  w = w_cmd;
-
-  // If cmd_vel stops arriving (e.g., transport congestion), don't keep driving
-  // forever on the last command.
-  if (last_cmd_vel_ms != 0 && (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS) {
-    v = 0.0f;
-    w = 0.0f;
-    v_cmd = 0.0f;
-    w_cmd = 0.0f;
-  }
-
-  // -------- Diff Drive --------
-  float vL = v - w * WHEEL_BASE / 2.0f;
-  float vR = v + w * WHEEL_BASE / 2.0f;
-
-  // Saturate wheel speeds individually - clamp each wheel to max
-  // This preserves turning at the cost of forward speed if needed
-  if (fabsf(vL) > MAX_WHEEL_SPEED_MPS) {
-    vL = (vL > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
-  }
-  if (fabsf(vR) > MAX_WHEEL_SPEED_MPS) {
-    vR = (vR > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
-  }
-
-  float rpmL_target = vL / WHEEL_CIRC * 60.0f;
-  float rpmR_target = vR / WHEEL_CIRC * 60.0f;
 
   // -------- Encoder --------
   noInterrupts();
@@ -409,92 +391,60 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   (void)odom_ret; // Suppress unused warning
 
   // -------- RPM --------
-  float rpmL = (dsL / WHEEL_CIRC) / dt * 60.0f;
-  float rpmR = (dsR / WHEEL_CIRC) / dt * 60.0f;
-
-  // Calculate actual velocities from encoder measurements
-  float vL_actual = dsL / dt;
-  float vR_actual = dsR / dt;
-
-  unsigned long now = millis();
-
-  // -------- Control --------
-  int pwm_L_out = 0, pwm_R_out = 0;
-
-  // Feedforward PWM from desired RPM
-  auto pwm_ff_from_rpm = [](float rpm_target, int pwm_static) -> int {
-    if (rpm_target == 0.0f)
-      return 0;
-
-    float pwm = rpm_target * RPM_TO_PWM;
-    // Add static friction compensation
-    if (pwm > 0) {
-      pwm += pwm_static;
-    } else {
-      pwm -= pwm_static;
-    }
-    return (int)constrain((int)pwm, -PWM_MAX, PWM_MAX);
-  };
-
-  const int pwmL_ff = pwm_ff_from_rpm(rpmL_target, PWM_STATIC_L);
-  const int pwmR_ff = pwm_ff_from_rpm(rpmR_target, PWM_STATIC_R);
+  left_measured_rpm = (dsL / WHEEL_CIRC) / dt * 60.0f;
+  right_measured_rpm = (dsR / WHEEL_CIRC) / dt * 60.0f;
 
   // Simple logic: if robot command is zero, stop. Otherwise drive both wheels.
   // Never check individual wheel thresholds - that breaks curves!
-  bool robot_stopped = (fabs(v_cmd) < 0.001f) && (fabs(w_cmd) < 0.001f);
-  
+  bool robot_stopped = (fabs(v_odom) < 0.001f) && (fabs(w_odom) < 0.001f);
+
+  int pwm_l = 0;
+  int pwm_r = 0;
+
   if (robot_stopped) {
     // Stop everything
     motor_left.brake();
     motor_right.brake();
-    int_L = 0;
-    prev_error_L = 0;
-    p_term_L = i_term_L = d_term_L = 0;
-    int_R = 0;
-    prev_error_R = 0;
-    p_term_R = i_term_R = d_term_R = 0;
-    pwm_L_out = 0;
-    pwm_R_out = 0;
+    left_cmd = 0.0;
+    right_cmd = 0.0;
+    if (motor_left_pid.GetMode() != MANUAL) {
+      motor_left_pid.SetMode(MANUAL);
+    }
+    if (motor_right_pid.GetMode() != MANUAL) {
+      motor_right_pid.SetMode(MANUAL);
+    }
   } else {
-    // Robot is moving - ALWAYS drive BOTH wheels with their calculated values
-    // This is critical for smooth curves
-    pwm_L_out = motorPID(rpmL_target, rpmL, int_L, prev_error_L, dt, Kp_L, Ki_L,
-                         Kd_L, p_term_L, i_term_L, d_term_L, pwmL_ff);
-    pwm_R_out = motorPID(rpmR_target, rpmR, int_R, prev_error_R, dt, Kp_R, Ki_R,
-                         Kd_R, p_term_R, i_term_R, d_term_R, pwmR_ff);
-    
-    // Drive both motors - no conditions, no checks
-    motor_left.drive(pwm_L_out);
-    motor_right.drive(pwm_R_out);
+
+    if (motor_left_pid.GetMode() != AUTOMATIC) {
+      motor_left_pid.SetMode(AUTOMATIC);
+    }
+    if (motor_right_pid.GetMode() != AUTOMATIC) {
+      motor_right_pid.SetMode(AUTOMATIC);
+    }
+
+    motor_left_pid.Compute();
+    motor_right_pid.Compute();
+
+    pwm_l = (int)constrain((int)(left_cmd * left_direction_coeff), -PWM_MAX,
+                           PWM_MAX);
+    pwm_r = (int)constrain((int)(right_cmd * right_direction_coeff), -PWM_MAX,
+                           PWM_MAX);
+    motor_left.drive(pwm_l);
+    motor_right.drive(pwm_r);
   }
 
-  // -------- Debug Logging --------
 #if MOTOR_DEBUG_LOGS
-  static unsigned long last_log_ms = 0;
-  if (now - last_log_ms >= MOTOR_DEBUG_LOG_PERIOD_MS) {
-    char log_buffer[220];
-    snprintf(log_buffer, sizeof(log_buffer),
-             "v:%.3f w:%.3f | vL:%.3f(%.3f) vR:%.3f(%.3f) | "
-             "rpmL:%.1f(%.1f) rpmR:%.1f(%.1f) | "
-             "pwmL:%d(ff:%d) pwmR:%d(ff:%d)",
-             v, w, vL, vL_actual, vR, vR_actual, rpmL_target, rpmL,
-             rpmR_target, rpmR, pwm_L_out, pwmL_ff, pwm_R_out, pwmR_ff);
-    log_debug(log_buffer);
-    last_log_ms = now;
-  }
-#endif
-
-  // Detailed tuning logs (separate cadence from the main kinematics log)
-#if MOTOR_TUNE_LOGS
-  static unsigned long last_tune_log_ms = 0;
-  if (now - last_tune_log_ms >= MOTOR_TUNE_LOG_PERIOD_MS) {
-    char tune_buffer[128];
-    snprintf(tune_buffer, sizeof(tune_buffer),
-             "L: P=%.1f I=%.1f D=%.1f OUT=%d FF=%d | R: P=%.1f I=%.1f D=%.1f OUT=%d FF=%d",
-             p_term_L, i_term_L, d_term_L, pwm_L_out, pwmL_ff, p_term_R,
-             i_term_R, d_term_R, pwm_R_out, pwmR_ff);
-    log_debug(tune_buffer);
-    last_tune_log_ms = now;
+  static int64_t last_motor_log_ms = 0;
+  const int64_t now_log_ms = now_ms();
+  if (now_log_ms - last_motor_log_ms >= MOTOR_DEBUG_LOG_PERIOD_MS) {
+    char log_buf[220];
+    snprintf(log_buf, sizeof(log_buf),
+             "motor: tgt_rpm L=%.1f R=%.1f | meas_rpm L=%.1f R=%.1f | pwm L=%d R=%d | dt=%.3f",
+             (double)left_target_rpm, (double)right_target_rpm,
+             (double)left_measured_rpm, (double)right_measured_rpm, pwm_l,
+             pwm_r, dt);
+    log_debug(log_buf);
+    last_motor_log_ms = now_log_ms;
   }
 #endif
 }
@@ -502,15 +452,56 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 void cmd_vel_callback(const void *msgin) {
   const geometry_msgs__msg__TwistStamped *msg =
       (const geometry_msgs__msg__TwistStamped *)msgin;
-  // Don't threshold here - let the differential drive kinematics and motor control handle it
-  // Thresholding cmd_vel causes jerky curves when one component is small
-  v_cmd = msg->twist.linear.x;
-  
-  // Limit angular velocity to prevent one wheel going backwards during curves
-  // w=4.0 rad/s is way too high and causes stuttering
-  w_cmd = constrain(msg->twist.angular.z, -MAX_ANGULAR_SPEED_Z, MAX_ANGULAR_SPEED_Z);
+
+  float v = msg->twist.linear.x;
+  float w = constrain(msg->twist.angular.z, -MAX_ANGULAR_SPEED_Z,
+                      MAX_ANGULAR_SPEED_Z);
+
+  // -------- Diff Drive --------
+  float vL = v - w * WHEEL_BASE / 2.0f;
+  float vR = v + w * WHEEL_BASE / 2.0f;
+
+  // Saturate wheel speeds individually - clamp each wheel to max
+  // This preserves turning at the cost of forward speed if needed
+  if (fabsf(vL) > MAX_WHEEL_SPEED_MPS) {
+    vL = (vL > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
+  }
+  if (fabsf(vR) > MAX_WHEEL_SPEED_MPS) {
+    vR = (vR > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
+  }
+
+  left_direction_coeff =
+      (vL >= 0.0f) ? 1.0f : -1.0f; // Update direction coefficient
+  right_direction_coeff = (vR >= 0.0f) ? 1.0f : -1.0f;
+
+  left_target_rpm = fabs(vL / WHEEL_CIRC * 60.0f);
+  right_target_rpm = fabs(vR / WHEEL_CIRC * 60.0f);
+
+  // If cmd_vel stops arriving (e.g., transport congestion), don't keep driving
+  // forever on the last command.
+  const bool cmd_timed_out =
+      (last_cmd_vel_ms != 0 && (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
+  if (cmd_timed_out) {
+    left_target_rpm = 0.0f;
+    right_target_rpm = 0.0f;
+  }
 
   last_cmd_vel_ms = now_ms();
+
+#if MOTOR_DEBUG_LOGS
+  static int64_t last_cmd_log_ms = 0;
+  const int64_t now_log_ms = last_cmd_vel_ms;
+  if (now_log_ms - last_cmd_log_ms >= MOTOR_DEBUG_LOG_PERIOD_MS) {
+    char log_buf[220];
+    snprintf(log_buf, sizeof(log_buf),
+             "cmd_vel: v=%.3f w=%.3f | vL=%.3f vR=%.3f | tgt_rpm L=%.1f R=%.1f | dir L=%.0f R=%.0f | timeout=%d",
+             v, w, vL, vR, (double)left_target_rpm, (double)right_target_rpm,
+             (double)left_direction_coeff, (double)right_direction_coeff,
+             cmd_timed_out ? 1 : 0);
+    log_debug(log_buf);
+    last_cmd_log_ms = now_log_ms;
+  }
+#endif
 }
 
 // ---------------- Arduino setup ----------------
@@ -527,6 +518,10 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(ENC_A_L), isrLeft, RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_A_R), isrRight, RISING);
+
+  motor_left_pid.SetMode(AUTOMATIC);
+  motor_right_pid.SetMode(AUTOMATIC);
+
   Serial.begin(COM_RATE);
 
   // Initialize micro-ROS serial transport
@@ -589,17 +584,17 @@ void setup() {
   log_info("Node initialized");
 
   // IMU publisher
-    rmw_qos_profile_t sensor_qos = rmw_qos_profile_sensor_data; // best-effort
-    sensor_qos.depth = 5;
-    rcl_publisher_options_t sensor_pub_options =
+  rmw_qos_profile_t sensor_qos = rmw_qos_profile_sensor_data; // best-effort
+  sensor_qos.depth = 5;
+  rcl_publisher_options_t sensor_pub_options =
       rcl_publisher_get_default_options();
-    sensor_pub_options.qos = sensor_qos;
+  sensor_pub_options.qos = sensor_qos;
 
-    ret = rcl_publisher_init(
+  ret = rcl_publisher_init(
       &imu_pub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-      "imu/data", &sensor_pub_options);
-    (void)ret;
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray), "imu/data",
+      &sensor_pub_options);
+  (void)ret;
 
   imu_msg.data.capacity = 6;
   imu_msg.data.size = 6;
@@ -608,10 +603,10 @@ void setup() {
   log_info("IMU publisher initialized");
 
   // Odometry publisher
-    ret = rcl_publisher_init(
-      &odom_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-      "odom", &sensor_pub_options);
-    (void)ret;
+  ret = rcl_publisher_init(&odom_pub, &node,
+                           ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+                           "odom", &sensor_pub_options);
+  (void)ret;
 
   // Initialize odometry message
   nav_msgs__msg__Odometry__init(&odom_msg);
@@ -648,22 +643,23 @@ void setup() {
   pid_tune_msg.data.size = 0;
   pid_tune_msg.data.data = (float *)malloc(6 * sizeof(float));
 
-  rclc_executor_init(&executor, &support.context, TIMER_COUNT + SUBSCRIPTION_COUNT, &allocator);
+  rclc_executor_init(&executor, &support.context,
+                     TIMER_COUNT + SUBSCRIPTION_COUNT, &allocator);
   rclc_executor_add_timer(&executor, &agent_alive_timer);
   rclc_executor_add_timer(&executor, &imu_timer);
   rclc_executor_add_timer(&executor, &motor_timer);
 
   // cmd_vel subscriber
-    rmw_qos_profile_t cmd_qos = rmw_qos_profile_sensor_data; // best-effort
-    cmd_qos.depth = 1;
-    rcl_subscription_options_t cmd_sub_options =
+  rmw_qos_profile_t cmd_qos = rmw_qos_profile_sensor_data; // best-effort
+  cmd_qos.depth = 1;
+  rcl_subscription_options_t cmd_sub_options =
       rcl_subscription_get_default_options();
-    cmd_sub_options.qos = cmd_qos;
-    ret = rcl_subscription_init(
+  cmd_sub_options.qos = cmd_qos;
+  ret = rcl_subscription_init(
       &cmd_vel_sub, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped), "cmd_vel",
       &cmd_sub_options);
-    (void)ret;
+  (void)ret;
   rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
                                  &cmd_vel_callback, ON_NEW_DATA);
 
@@ -694,60 +690,4 @@ void loop() {
   } else {
     esp_task_wdt_reset();
   }
-}
-
-// // ===================== Motor helpers =====================
-int motorPID(float target_rpm, float actual_rpm, float &integral,
-             float &prev_error, float dt, float Kp, float Ki, float Kd,
-             float &p_term, float &i_term, float &d_term, int pwm_ff) {
-  // No threshold check here - caller handles stopping logic
-  // This allows PID to work with any target including very small values during curves
-
-  float error = target_rpm - actual_rpm;
-
-  // Calculate derivative (rate of error change)
-  float derivative = 0;
-  if (dt > 0.001f) {
-    derivative = (error - prev_error) / dt;
-    // Simple low-pass filter on derivative to reduce noise
-    static float filtered_deriv_L = 0;
-    static float filtered_deriv_R = 0;
-    float alpha = 0.8f; // filter coefficient
-    if (&prev_error == &prev_error_L) {
-      filtered_deriv_L = alpha * derivative + (1 - alpha) * filtered_deriv_L;
-      derivative = filtered_deriv_L;
-    } else {
-      filtered_deriv_R = alpha * derivative + (1 - alpha) * filtered_deriv_R;
-      derivative = filtered_deriv_R;
-    }
-  }
-
-  // Predict integral first, then apply a simple anti-windup decision based on
-  // the final (feedforward + PID) PWM.
-  float integral_candidate = integral + error * dt;
-  integral_candidate = constrain(integral_candidate, -100, 100);
-
-  const float p_candidate = Kp * error;
-  const float d_candidate = Kd * derivative;
-  const float i_candidate = Ki * integral_candidate;
-  const float u_candidate = (float)pwm_ff + p_candidate + i_candidate + d_candidate;
-  const int pwm_candidate = (int)u_candidate;
-
-  const bool saturated = (pwm_candidate >= PWM_MAX) || (pwm_candidate <= -PWM_MAX);
-  if (!saturated || (error * integral < 0)) {
-    integral = integral_candidate;
-  }
-
-  p_term = Kp * error;
-  i_term = Ki * integral;
-  d_term = Kd * derivative;
-
-  float u = (float)pwm_ff + p_term + i_term + d_term;
-  int pwm = (int)u;
-
-  // Store error for next iteration
-  prev_error = error;
-
-  // Return PWM directly without deadband - we need full range for curves
-  return constrain((int)u, -PWM_MAX, PWM_MAX);
 }
