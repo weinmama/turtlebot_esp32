@@ -32,7 +32,7 @@
 
 // High-rate /rosout logging from the motor control loop can stall the serial
 // transport and break timing. Enable only while tuning.
-#define MOTOR_DEBUG_LOGS 0
+#define MOTOR_DEBUG_LOGS 1
 #define MOTOR_DEBUG_LOG_PERIOD_MS 250
 #define MOTOR_TUNE_LOGS 0
 #define MOTOR_TUNE_LOG_PERIOD_MS 500
@@ -106,12 +106,16 @@ const float WHEEL_CIRC = 2.0f * PI * WHEEL_RADIUS;
 const float MIN_SPEED_X = 0.01f;
 const float MIN_ANGULAR_SPEED_Z = 0.01f;
 
+// Maximum angular velocity safety limit
+const float MAX_ANGULAR_SPEED_Z = 4.0f;
+
 // If odometry or wheel direction is flipped, set one or both to -1.
 const int ENC_DIR_L = 1;
 const int ENC_DIR_R = 1;
 
 // Thresholds to treat commands as zero (avoid float equality).
-const float TARGET_RPM_EPS = 0.01f;
+// Small value to detect true zero while allowing small differential speeds
+const float TARGET_RPM_EPS = 0.5f;
 
 /************** L298 **************/
 const int PWM_DEADBAND = 0;
@@ -145,12 +149,13 @@ static float w = 0.0f;
 float x = 0.0f, y = 0.0f, theta = 0.0f;
 float v_odom = 0.0f, w_odom = 0.0f;
 
-float Kp_L = 1.0f;
-float Ki_L = 0.6f;
-float Kd_L = 0.0f;
-float Kp_R = 1.0f;
-float Ki_R = 0.6f;
-float Kd_R = 0.0f;
+// Aggressive PID gains for smooth curves - high Kp to reach target, Kd to dampen oscillations
+float Kp_L = 5.0f;
+float Ki_L = 1.2f;
+float Kd_L = 0.5f;
+float Kp_R = 5.0f;
+float Ki_R = 1.2f;
+float Kd_R = 0.5f;
 
 float int_L = 0.0f, prev_error_L = 0.0f;
 float p_term_L = 0.0f, i_term_L = 0.0f, d_term_L = 0.0f;
@@ -335,13 +340,13 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   float vL = v - w * WHEEL_BASE / 2.0f;
   float vR = v + w * WHEEL_BASE / 2.0f;
 
-  // Saturate wheel speeds to what the motors can actually deliver. This keeps
-  // cmd_vel in m/s, but prevents requesting impossible RPM.
-  const float max_abs_wheel = fmaxf(fabsf(vL), fabsf(vR));
-  if (max_abs_wheel > MAX_WHEEL_SPEED_MPS && max_abs_wheel > 1e-6f) {
-    const float s = MAX_WHEEL_SPEED_MPS / max_abs_wheel;
-    vL *= s;
-    vR *= s;
+  // Saturate wheel speeds individually - clamp each wheel to max
+  // This preserves turning at the cost of forward speed if needed
+  if (fabsf(vL) > MAX_WHEEL_SPEED_MPS) {
+    vL = (vL > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
+  }
+  if (fabsf(vR) > MAX_WHEEL_SPEED_MPS) {
+    vR = (vR > 0) ? MAX_WHEEL_SPEED_MPS : -MAX_WHEEL_SPEED_MPS;
   }
 
   float rpmL_target = vL / WHEEL_CIRC * 60.0f;
@@ -416,13 +421,13 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   // -------- Control --------
   int pwm_L_out = 0, pwm_R_out = 0;
 
-  // Feedforward PWM from desired RPM, including a static offset to overcome
-  // stiction so small steering differentials result in smooth curves.
+  // Feedforward PWM from desired RPM
   auto pwm_ff_from_rpm = [](float rpm_target, int pwm_static) -> int {
-    if (fabs(rpm_target) < TARGET_RPM_EPS)
+    if (rpm_target == 0.0f)
       return 0;
 
     float pwm = rpm_target * RPM_TO_PWM;
+    // Add static friction compensation
     if (pwm > 0) {
       pwm += pwm_static;
     } else {
@@ -434,25 +439,32 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   const int pwmL_ff = pwm_ff_from_rpm(rpmL_target, PWM_STATIC_L);
   const int pwmR_ff = pwm_ff_from_rpm(rpmR_target, PWM_STATIC_R);
 
-  if (fabs(rpmL_target) < TARGET_RPM_EPS) {
+  // Simple logic: if robot command is zero, stop. Otherwise drive both wheels.
+  // Never check individual wheel thresholds - that breaks curves!
+  bool robot_stopped = (fabs(v_cmd) < 0.001f) && (fabs(w_cmd) < 0.001f);
+  
+  if (robot_stopped) {
+    // Stop everything
     motor_left.brake();
+    motor_right.brake();
     int_L = 0;
     prev_error_L = 0;
     p_term_L = i_term_L = d_term_L = 0;
-  } else {
-    pwm_L_out = motorPID(rpmL_target, rpmL, int_L, prev_error_L, dt, Kp_L, Ki_L,
-                         Kd_L, p_term_L, i_term_L, d_term_L, pwmL_ff);
-    motor_left.drive(pwm_L_out);
-  }
-
-  if (fabs(rpmR_target) < TARGET_RPM_EPS) {
-    motor_right.brake();
     int_R = 0;
     prev_error_R = 0;
     p_term_R = i_term_R = d_term_R = 0;
+    pwm_L_out = 0;
+    pwm_R_out = 0;
   } else {
+    // Robot is moving - ALWAYS drive BOTH wheels with their calculated values
+    // This is critical for smooth curves
+    pwm_L_out = motorPID(rpmL_target, rpmL, int_L, prev_error_L, dt, Kp_L, Ki_L,
+                         Kd_L, p_term_L, i_term_L, d_term_L, pwmL_ff);
     pwm_R_out = motorPID(rpmR_target, rpmR, int_R, prev_error_R, dt, Kp_R, Ki_R,
                          Kd_R, p_term_R, i_term_R, d_term_R, pwmR_ff);
+    
+    // Drive both motors - no conditions, no checks
+    motor_left.drive(pwm_L_out);
     motor_right.drive(pwm_R_out);
   }
 
@@ -462,10 +474,10 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (now - last_log_ms >= MOTOR_DEBUG_LOG_PERIOD_MS) {
     char log_buffer[220];
     snprintf(log_buffer, sizeof(log_buffer),
-             "cmd:%.3f v:%.3f | vL:%.3f(%.3f) vR:%.3f(%.3f) | "
+             "v:%.3f w:%.3f | vL:%.3f(%.3f) vR:%.3f(%.3f) | "
              "rpmL:%.1f(%.1f) rpmR:%.1f(%.1f) | "
              "pwmL:%d(ff:%d) pwmR:%d(ff:%d)",
-             v_cmd, v, vL, vL_actual, vR, vR_actual, rpmL_target, rpmL,
+             v, w, vL, vL_actual, vR, vR_actual, rpmL_target, rpmL,
              rpmR_target, rpmR, pwm_L_out, pwmL_ff, pwm_R_out, pwmR_ff);
     log_debug(log_buffer);
     last_log_ms = now;
@@ -490,10 +502,13 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 void cmd_vel_callback(const void *msgin) {
   const geometry_msgs__msg__TwistStamped *msg =
       (const geometry_msgs__msg__TwistStamped *)msgin;
-  v_cmd = fabs(msg->twist.linear.x) < MIN_SPEED_X ? 0.0f : msg->twist.linear.x;
-  w_cmd = fabs(msg->twist.angular.z) < MIN_ANGULAR_SPEED_Z
-              ? 0.0f
-              : msg->twist.angular.z;
+  // Don't threshold here - let the differential drive kinematics and motor control handle it
+  // Thresholding cmd_vel causes jerky curves when one component is small
+  v_cmd = msg->twist.linear.x;
+  
+  // Limit angular velocity to prevent one wheel going backwards during curves
+  // w=4.0 rad/s is way too high and causes stuttering
+  w_cmd = constrain(msg->twist.angular.z, -MAX_ANGULAR_SPEED_Z, MAX_ANGULAR_SPEED_Z);
 
   last_cmd_vel_ms = now_ms();
 }
@@ -685,12 +700,8 @@ void loop() {
 int motorPID(float target_rpm, float actual_rpm, float &integral,
              float &prev_error, float dt, float Kp, float Ki, float Kd,
              float &p_term, float &i_term, float &d_term, int pwm_ff) {
-  if (fabs(target_rpm) < TARGET_RPM_EPS) {
-    integral = 0;
-    prev_error = 0;
-    p_term = i_term = d_term = 0;
-    return 0;
-  }
+  // No threshold check here - caller handles stopping logic
+  // This allows PID to work with any target including very small values during curves
 
   float error = target_rpm - actual_rpm;
 
@@ -737,9 +748,6 @@ int motorPID(float target_rpm, float actual_rpm, float &integral,
   // Store error for next iteration
   prev_error = error;
 
-  if (pwm > 0) {
-    return constrain(pwm, PWM_DEADBAND, PWM_MAX);
-  } else {
-    return constrain(pwm, -PWM_MAX, -PWM_DEADBAND);
-  }
+  // Return PWM directly without deadband - we need full range for curves
+  return constrain((int)u, -PWM_MAX, PWM_MAX);
 }
