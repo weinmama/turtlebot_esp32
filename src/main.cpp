@@ -143,7 +143,7 @@ PID motor_right_pid(&right_measured_rpm, &right_cmd, &right_target_rpm, Kp_R,
                     Ki_R, Kd_R, DIRECT);
 
 Motor motor_left(BIN1, BIN2, PWMB, -1, STBY, 20000, 8, 2);
-Motor motor_right(AIN1, AIN2, PWMA, -1, STBY, 20000, 8, 2);
+Motor motor_right(AIN1, AIN2, PWMA, -1, STBY, 20000, 8, 1);
 
 int64_t last_agent_ok_ms = 0;
 
@@ -359,12 +359,17 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   (void)odom_ret; // Suppress unused warning
 
   // -------- RPM --------
-  left_measured_rpm = (dsL / WHEEL_CIRC) / dt * 60.0f;
-  right_measured_rpm = (dsR / WHEEL_CIRC) / dt * 60.0f;
+  left_measured_rpm = fabs((dsL / WHEEL_CIRC) / dt * 60.0f);
+  right_measured_rpm = fabs((dsR / WHEEL_CIRC) / dt * 60.0f);
 
-  // Simple logic: if robot command is zero, stop. Otherwise drive both wheels.
-  // Never check individual wheel thresholds - that breaks curves!
-  bool robot_stopped = (fabs(v_odom) < 0.001f) && (fabs(w_odom) < 0.001f);
+  // Decide whether to stop based on commanded targets (not measured odometry).
+  // Using odometry here can keep the robot braked forever at standstill.
+  const bool cmd_timed_out =
+      (last_cmd_vel_ms != 0 &&
+       (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
+  const bool targets_zero = ((fabs(left_target_rpm) < TARGET_RPM_EPS) &&
+                             (fabs(right_target_rpm) < TARGET_RPM_EPS));
+  const bool robot_stopped = cmd_timed_out || targets_zero;
 
   int pwm_l = 0;
   int pwm_r = 0;
@@ -445,15 +450,6 @@ void cmd_vel_callback(const void *msgin) {
   left_target_rpm = fabs(vL / WHEEL_CIRC * 60.0f);
   right_target_rpm = fabs(vR / WHEEL_CIRC * 60.0f);
 
-  // If cmd_vel stops arriving (e.g., transport congestion), don't keep driving
-  // forever on the last command.
-  const bool cmd_timed_out =
-      (last_cmd_vel_ms != 0 && (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
-  if (cmd_timed_out) {
-    left_target_rpm = 0.0f;
-    right_target_rpm = 0.0f;
-  }
-
   last_cmd_vel_ms = now_ms();
 
 #if MOTOR_DEBUG_LOGS
@@ -465,7 +461,7 @@ void cmd_vel_callback(const void *msgin) {
              "cmd_vel: v=%.3f w=%.3f | vL=%.3f vR=%.3f | tgt_rpm L=%.1f R=%.1f | dir L=%.0f R=%.0f | timeout=%d",
              v, w, vL, vR, (double)left_target_rpm, (double)right_target_rpm,
              (double)left_direction_coeff, (double)right_direction_coeff,
-             cmd_timed_out ? 1 : 0);
+             0);
     log_debug(log_buf);
     last_cmd_log_ms = now_log_ms;
   }
