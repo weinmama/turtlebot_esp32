@@ -10,12 +10,10 @@
 #include <rcutils/logging_macros.h>
 #include <rmw_microros/rmw_microros.h>
 
-#include <geometry_msgs/msg/transform_stamped.h>
 #include <geometry_msgs/msg/twist_stamped.h>
 #include <nav_msgs/msg/odometry.h>
 #include <rcl_interfaces/msg/log.h>
 #include <std_msgs/msg/float32_multi_array.h>
-#include <std_msgs/msg/string.h>
 
 #include <esp_timer.h>
 #include "esp_task_wdt.h"
@@ -36,8 +34,6 @@
 // transport and break timing. Enable only while tuning.
 #define MOTOR_DEBUG_LOGS 1
 #define MOTOR_DEBUG_LOG_PERIOD_MS 250
-#define MOTOR_TUNE_LOGS 0
-#define MOTOR_TUNE_LOG_PERIOD_MS 500
 
 // TB6012FNG H-Bridge Connection PINs
 #define AIN1 26 // Motor A direction pin 1
@@ -47,12 +43,6 @@
 #define BIN2 32 // Motor B direction pin 2
 #define PWMB 14 // Motor B PWM speed control
 #define STBY 12 // Standby pin (must be HIGH to enable motors)
-
-// Wheel Encoders Connection PINs
-#define right_encoder_phaseA 19 // Interrupt
-#define right_encoder_phaseB 18
-#define left_encoder_phaseA 5
-#define left_encoder_phaseB 17
 
 #define TIMER_COUNT 3
 #define SUBSCRIPTION_COUNT 2
@@ -105,9 +95,6 @@ const float WHEEL_BASE = 0.20f;
 const int PULSES_PER_REV = 614;
 const float WHEEL_CIRC = 2.0f * PI * WHEEL_RADIUS;
 
-const float MIN_SPEED_X = 0.01f;
-const float MIN_ANGULAR_SPEED_Z = 0.01f;
-
 // Maximum angular velocity safety limit
 const float MAX_ANGULAR_SPEED_Z = 4.0f;
 
@@ -119,34 +106,15 @@ const int ENC_DIR_R = 1;
 // Small value to detect true zero while allowing small differential speeds
 const float TARGET_RPM_EPS = 0.5f;
 
-/************** L298 **************/
-const int PWM_DEADBAND = 0;
 const int PWM_MAX = 255;
 
-// Motor capability (used for saturation + feedforward). Adjust to match your
-// measured max RPM at PWM_MAX.
+// Motor capability (used for speed saturation). Adjust to match your measured
+// max RPM at PWM_MAX.
 const float MAX_MOTOR_RPM = 100.0f;
 const float MAX_WHEEL_SPEED_MPS = (MAX_MOTOR_RPM / 60.0f) * WHEEL_CIRC;
-const float RPM_TO_PWM = (float)PWM_MAX / MAX_MOTOR_RPM;
-
-// Static friction compensation (feedforward offset). If curves feel like
-// "straight then suddenly turn", increase these a bit (typical 15-60).
-// If low speeds feel too jumpy, decrease.
-const int PWM_STATIC_L = 30;
-const int PWM_STATIC_R = 30;
-
-/************** Ramps **************/
-const float A_MAX = 0.5f;
-
-/************** Control **************/
-static float v_cmd = 0.0f;
-static float w_cmd = 0.0f;
 
 static int64_t last_cmd_vel_ms = 0;
 static const int64_t CMD_VEL_TIMEOUT_MS = 500;
-
-static float v = 0.0f;
-static float w = 0.0f;
 
 float x = 0.0f, y = 0.0f, theta = 0.0f;
 float v_odom = 0.0f, w_odom = 0.0f;
