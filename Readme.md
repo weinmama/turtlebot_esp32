@@ -38,22 +38,15 @@ docker run -it --rm   --net=host   --device=/dev/ttyUSB1   microros/micro-ros-ag
 
 ## remote deployment on the raspberry pi
 
-``` 
-sudo apt install pipx
+Im Turtlebox-Hauptrepository vom Entwicklungsrechner aus:
 
-pipx ensurepath
+```bash
+mise run deploy:esp32
 ```
 
-
-```
-ssh robot-pi "
-  ~/.local/bin/esptool \
-    --chip esp32 \
-    --port /dev/ttyUSB1 \
-    --baud 460800 \
-    write_flash 0x10000 /tmp/firmware.bin
-"
-```
+Dies baut lokal und flasht alle benötigten Images per SSH auf `robot-pi`
+über `/dev/esp32`. Dokumentation: `scripts/esp32/README.md` im Hauptrepository.
+Nur bauen: `mise run build:esp32`.
 
 Tests
 
