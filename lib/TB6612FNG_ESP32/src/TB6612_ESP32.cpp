@@ -13,6 +13,7 @@ Motor::Motor(int In1pin, int In2pin, int PWMpin, int offset, int STBYpin, int fr
   Standby = STBYpin;
   Offset = offset;
   Channel=channel_pin;
+  BrakeDuty = (1UL << resolution) - 1;
 
   pinMode(In1, OUTPUT);
   pinMode(In2, OUTPUT);
@@ -56,7 +57,8 @@ void Motor::brake()
 {
    digitalWrite(In1, HIGH);
    digitalWrite(In2, HIGH);
-   ledcWrite(Channel, 0);
+   // TB6612 short brake requires both inputs HIGH and PWM HIGH.
+   ledcWrite(Channel, BrakeDuty);
 }
 
 void Motor::standby()

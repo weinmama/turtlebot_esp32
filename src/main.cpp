@@ -23,7 +23,7 @@
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
 #define AGENT_DEAD_TIMEOUT_MS 5000 // Milliseconds
-#define AGENT_ALIVE_CHECK_MS 100   // Milliseconds
+#define AGENT_ALIVE_CHECK_MS 500   // Milliseconds
 #define MOTOR_CONTROL_RATE_MS 100  // Milliseconds
 #define EXECUTOR_SPIN_RATE_MS 5    // Milliseconds
 #define IMU_UPDATE_RATE_MS 20      // Milliseconds
@@ -142,6 +142,8 @@ double left_target_rpm_req = 0.0;
 double right_target_rpm_req = 0.0;
 double left_target_rpm = 0.0;
 double right_target_rpm = 0.0;
+double left_ramped_rpm = 0.0;
+double right_ramped_rpm = 0.0;
 
 float left_direction_coeff = 1.0f;
 float right_direction_coeff = 1.0f;
@@ -253,7 +255,7 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (timer == NULL)
     return;
 
-  if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
+  if (rmw_uros_ping_agent(5, 1) == RMW_RET_OK) {
     last_agent_ok_ms = now_ms();
   }
 }
@@ -315,8 +317,18 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   const float dt = (now_us - last_motor_us) / 1e6f;
   last_motor_us = now_us;
 
-  if (dt <= 0.0f || dt > 0.5f) {
+  if (dt <= 0.0f) {
     return;
+  }
+
+  // A delayed executor must not leave the previous motor output running.
+  if (dt > 0.5f) {
+    motor_left.brake();
+    motor_right.brake();
+    motor_left_pid.SetMode(MANUAL);
+    motor_right_pid.SetMode(MANUAL);
+    left_cmd = right_cmd = 0.0;
+    left_ramped_rpm = right_ramped_rpm = 0.0;
   }
 
   // -------- Encoder --------
@@ -386,36 +398,40 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
        (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
   const bool targets_zero = ((fabs(left_target_rpm_req) < TARGET_RPM_EPS) &&
                              (fabs(right_target_rpm_req) < TARGET_RPM_EPS));
-  const bool robot_stopped = cmd_timed_out || targets_zero;
+  const bool robot_stopped = cmd_timed_out || targets_zero || dt > 0.5f;
 
   // Slew-limit the actual PID setpoints towards the requested targets.
   const float max_delta_rpm = TARGET_RPM_RAMP_PER_S * dt;
+  const double previous_left_rpm = left_ramped_rpm;
+  const double previous_right_rpm = right_ramped_rpm;
   if (robot_stopped) {
-    left_target_rpm = 0.0;
-    right_target_rpm = 0.0;
+    left_ramped_rpm = right_ramped_rpm = 0.0;
   } else {
-    double dl = left_target_rpm_req - left_target_rpm;
+    double dl = left_direction_coeff * left_target_rpm_req - left_ramped_rpm;
     if (dl > (double)max_delta_rpm) {
       dl = (double)max_delta_rpm;
     } else if (dl < -(double)max_delta_rpm) {
       dl = -(double)max_delta_rpm;
     }
-    left_target_rpm += dl;
+    left_ramped_rpm += dl;
 
-    double dr = right_target_rpm_req - right_target_rpm;
+    double dr = right_direction_coeff * right_target_rpm_req - right_ramped_rpm;
     if (dr > (double)max_delta_rpm) {
       dr = (double)max_delta_rpm;
     } else if (dr < -(double)max_delta_rpm) {
       dr = -(double)max_delta_rpm;
     }
-    right_target_rpm += dr;
-
-    if (left_target_rpm < 0.0) {
-      left_target_rpm = 0.0;
-    }
-    if (right_target_rpm < 0.0) {
-      right_target_rpm = 0.0;
-    }
+    right_ramped_rpm += dr;
+  }
+  left_target_rpm = fabs(left_ramped_rpm);
+  right_target_rpm = fabs(right_ramped_rpm);
+  if (previous_left_rpm * left_ramped_rpm < 0.0) {
+    motor_left_pid.SetMode(MANUAL);
+    left_cmd = 0.0;
+  }
+  if (previous_right_rpm * right_ramped_rpm < 0.0) {
+    motor_right_pid.SetMode(MANUAL);
+    right_cmd = 0.0;
   }
 
   int pwm_l = 0;
@@ -442,11 +458,8 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
       motor_right_pid.SetMode(AUTOMATIC);
     }
 
-    motor_left_pid.Compute();
-    motor_right_pid.Compute();
-
-    const int sign_l = (left_direction_coeff >= 0.0f) ? 1 : -1;
-    const int sign_r = (right_direction_coeff >= 0.0f) ? 1 : -1;
+    const int sign_l = (left_ramped_rpm >= 0.0) ? 1 : -1;
+    const int sign_r = (right_ramped_rpm >= 0.0) ? 1 : -1;
 
     int pwm_ff_l = (int)lround(fabs(left_target_rpm) * RPM_TO_PWM);
     int pwm_ff_r = (int)lround(fabs(right_target_rpm) * RPM_TO_PWM);
@@ -459,13 +472,31 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
       pwm_ff_r = min(PWM_MAX, pwm_ff_r + PWM_STATIC_R);
     }
 
+    // Limit the integral and correction to the actuator headroom.
+    motor_left_pid.SetOutputLimits(-pwm_ff_l, PWM_MAX - pwm_ff_l);
+    motor_right_pid.SetOutputLimits(-pwm_ff_r, PWM_MAX - pwm_ff_r);
+    motor_left_pid.Compute();
+    motor_right_pid.Compute();
+
     const int pwm_mag_l = constrain(pwm_ff_l + (int)lround(left_cmd), 0, PWM_MAX);
     const int pwm_mag_r = constrain(pwm_ff_r + (int)lround(right_cmd), 0, PWM_MAX);
 
     pwm_l = sign_l * pwm_mag_l;
     pwm_r = sign_r * pwm_mag_r;
-    motor_left.drive(pwm_l);
-    motor_right.drive(pwm_r);
+    if (left_target_rpm < TARGET_RPM_EPS) {
+      motor_left.brake();
+      motor_left_pid.SetMode(MANUAL);
+      left_cmd = 0.0;
+    } else {
+      motor_left.drive(pwm_l);
+    }
+    if (right_target_rpm < TARGET_RPM_EPS) {
+      motor_right.brake();
+      motor_right_pid.SetMode(MANUAL);
+      right_cmd = 0.0;
+    } else {
+      motor_right.drive(pwm_r);
+    }
   }
 
 #if MOTOR_DEBUG_LOGS
@@ -489,6 +520,10 @@ void cmd_vel_callback(const void *msgin) {
       (const geometry_msgs__msg__TwistStamped *)msgin;
 
   float v = msg->twist.linear.x;
+  if (!isfinite(v) || !isfinite(msg->twist.angular.z)) {
+    left_target_rpm_req = right_target_rpm_req = 0.0;
+    return;
+  }
   float w = constrain(msg->twist.angular.z, -MAX_ANGULAR_SPEED_Z,
                       MAX_ANGULAR_SPEED_Z);
 
@@ -536,6 +571,8 @@ void setup() {
   // activate standby
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
+  motor_left.brake();
+  motor_right.brake();
 
   pinMode(ENC_A_L, INPUT_PULLUP);
   pinMode(ENC_B_L, INPUT_PULLUP);

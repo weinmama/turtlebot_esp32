@@ -36,6 +36,7 @@ class Motor
   private:
     //variables for the 2 inputs, PWM input, Offset value, and the Standby pin
 	int In1, In2, PWM, Offset,Standby,Channel;
+    uint32_t BrakeDuty;
 
 	//private functions that spin the motor CC and CCW
 	void fwd(int speed);
