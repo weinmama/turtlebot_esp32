@@ -74,6 +74,7 @@ rclc_executor_t executor;
 rcl_publisher_t rosout_pub;
 rcl_publisher_t imu_pub;
 rcl_publisher_t odom_pub;
+rcl_publisher_t motor_state_pub;
 
 rcl_subscription_t cmd_vel_sub;
 rcl_subscription_t pid_tune_sub;
@@ -82,6 +83,8 @@ geometry_msgs__msg__TwistStamped cmd_vel_msg;
 std_msgs__msg__Float32MultiArray pid_tune_msg;
 std_msgs__msg__Float32MultiArray imu_msg;
 nav_msgs__msg__Odometry odom_msg;
+std_msgs__msg__Float32MultiArray motor_state_msg;
+float motor_state_data[7];
 
 rcl_interfaces__msg__Log log_msg;
 bool rosout_pub_initialized = false;
@@ -116,12 +119,11 @@ const int PWM_MAX = 255;
 const float MAX_MOTOR_RPM = 100.0f;
 const float MAX_WHEEL_SPEED_MPS = (MAX_MOTOR_RPM / 60.0f) * WHEEL_CIRC;
 
-// Feedforward mapping + static friction compensation.
-// Increase MAX_MOTOR_RPM to your measured max wheel RPM at PWM_MAX.
-const float RPM_TO_PWM = (float)PWM_MAX / MAX_MOTOR_RPM;
-// Baseline PWM to overcome stiction (tune per wheel).
-const int PWM_STATIC_L = 45;
-const int PWM_STATIC_R = 45;
+// Feedforward mapping fitted to unloaded wheel measurements. Recheck under load.
+const float RPM_TO_PWM = 2.0f;
+// Feedforward intercept, not a guaranteed minimum PWM under load.
+const int PWM_STATIC_L = 16;
+const int PWM_STATIC_R = 16;
 
 // Slew-rate limit for wheel RPM targets to avoid a jump in velocity when
 // starting to move (especially with feedforward + static friction offset).
@@ -148,13 +150,13 @@ double right_ramped_rpm = 0.0;
 float left_direction_coeff = 1.0f;
 float right_direction_coeff = 1.0f;
 
-#define Kp_L 1.9f
-#define Ki_L 0.3f
-#define Kd_L 0.02f
+#define Kp_L 1.0f
+#define Ki_L 3.0f
+#define Kd_L 0.0f
 
-#define Kp_R 1.9f
-#define Ki_R 0.3f
-#define Kd_R 0.02f
+#define Kp_R 1.0f
+#define Ki_R 3.0f
+#define Kd_R 0.0f
 
 PID motor_left_pid(&left_measured_rpm, &left_cmd, &left_target_rpm, Kp_L, Ki_L,
                    Kd_L, DIRECT);
@@ -255,7 +257,7 @@ void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   if (timer == NULL)
     return;
 
-  if (rmw_uros_ping_agent(5, 1) == RMW_RET_OK) {
+  if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
     last_agent_ok_ms = now_ms();
   }
 }
@@ -513,6 +515,18 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     last_motor_log_ms = now_log_ms;
   }
 #endif
+
+  // Compact best-effort diagnostics: signed target and encoder RPM per wheel,
+  // applied PWM per wheel, and actual control interval in seconds.
+  motor_state_data[0] = left_ramped_rpm;
+  motor_state_data[1] = right_ramped_rpm;
+  motor_state_data[2] = (float)dL / PULSES_PER_REV / dt * 60.0f;
+  motor_state_data[3] = (float)dR / PULSES_PER_REV / dt * 60.0f;
+  motor_state_data[4] = pwm_l;
+  motor_state_data[5] = pwm_r;
+  motor_state_data[6] = dt;
+  rcl_ret_t motor_state_ret = rcl_publish(&motor_state_pub, &motor_state_msg, NULL);
+  (void)motor_state_ret;
 }
 
 void cmd_vel_callback(const void *msgin) {
@@ -600,6 +614,7 @@ void setup() {
   while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
     delay(1000);
   }
+  last_agent_ok_ms = now_ms();
 
   // start watchdog
   esp_task_wdt_init(WDT_TIMEOUT, true);
@@ -671,11 +686,25 @@ void setup() {
 
   log_info("IMU publisher initialized");
 
+  ret = rcl_publisher_init(
+      &motor_state_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+      "motor/state", &sensor_pub_options);
+  (void)ret;
+  motor_state_msg.data.data = motor_state_data;
+  motor_state_msg.data.size = 7;
+  motor_state_msg.data.capacity = 7;
+
   // Odometry publisher
+  // Odometry exceeds the best-effort transport MTU; reliable XRCE streams
+  // support fragmentation. Do not wait for acknowledgements in the control loop.
+  rcl_publisher_options_t odom_pub_options = sensor_pub_options;
+  odom_pub_options.qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   ret = rcl_publisher_init(&odom_pub, &node,
                            ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-                           "odom", &sensor_pub_options);
+                           "odom", &odom_pub_options);
   (void)ret;
+  rmw_uros_set_publisher_session_timeout(rcl_publisher_get_rmw_handle(&odom_pub), 0);
 
   // Initialize odometry message
   nav_msgs__msg__Odometry__init(&odom_msg);
