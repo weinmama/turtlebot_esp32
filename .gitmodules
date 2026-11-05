@@ -1,0 +1,3 @@
+[submodule "thirdparty/picoros"]
+	path = thirdparty/picoros
+	url = https://github.com/Pico-ROS/Pico-ROS-software.git

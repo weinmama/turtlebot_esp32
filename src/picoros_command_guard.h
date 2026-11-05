@@ -45,6 +45,7 @@ class PicoRosCommandGuard {
   }
 
   void invalidate() { mode_ = Mode::blocked; has_heartbeat_ = has_command_ = false; }
+  void clear_command() { has_command_ = false; }
 
  private:
   Mode mode_ = Mode::blocked;

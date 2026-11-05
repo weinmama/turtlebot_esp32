@@ -3,19 +3,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-#include <micro_ros_platformio.h>
-#include <rcl/rcl.h>
-#include <rclc/executor.h>
-#include <rclc/rclc.h>
-#include <rcutils/logging_macros.h>
-#include <rmw_microros/rmw_microros.h>
-
-#include <geometry_msgs/msg/twist_stamped.h>
-#include <nav_msgs/msg/odometry.h>
-#include <sensor_msgs/msg/imu.h>
-#include <rosidl_runtime_c/string_functions.h>
-#include <rcl_interfaces/msg/log.h>
-#include <std_msgs/msg/float32_multi_array.h>
+#include "robot_transport.h"
 
 #include <esp_timer.h>
 #include "esp_task_wdt.h"
@@ -25,13 +13,8 @@
 
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
-#define AGENT_DEAD_TIMEOUT_MS 5000 // Milliseconds
-#define AGENT_ALIVE_CHECK_MS 500   // Milliseconds
 #define MOTOR_CONTROL_RATE_MS 100  // Milliseconds
-#define EXECUTOR_SPIN_RATE_MS 5    // Milliseconds
 #define IMU_UPDATE_RATE_MS 50      // Milliseconds (20 Hz)
-#define COM_RATE 460800
-#define ROS_DOMAIN_ID 1
 
 // High-rate /rosout logging from the motor control loop can stall the serial
 // transport and break timing. Enable only while tuning.
@@ -47,8 +30,6 @@
 #define PWMB 14 // Motor B PWM speed control
 #define STBY 12 // Standby pin (must be HIGH to enable motors)
 
-#define TIMER_COUNT 3
-#define SUBSCRIPTION_COUNT 2
 
 /************** Pins **************/
 // left wheel
@@ -67,31 +48,12 @@
 Adafruit_MPU6050 imu;
 
 // ---------------- Globals ----------------
-rclc_support_t support;
-rcl_node_t node;
-rcl_timer_t imu_timer;
-rcl_timer_t motor_timer;
-rcl_timer_t agent_alive_timer;
-rclc_executor_t executor;
-
-rcl_publisher_t rosout_pub;
-rcl_publisher_t imu_pub;
-rcl_publisher_t odom_pub;
-rcl_publisher_t motor_state_pub;
-
-rcl_subscription_t cmd_vel_sub;
-rcl_subscription_t pid_tune_sub;
-
-geometry_msgs__msg__TwistStamped cmd_vel_msg;
-std_msgs__msg__Float32MultiArray pid_tune_msg;
-sensor_msgs__msg__Imu imu_msg;
-nav_msgs__msg__Odometry odom_msg;
-std_msgs__msg__Float32MultiArray motor_state_msg;
+RobotTransport transport;
+ros_TwistStamped cmd_vel_msg{};
+ros_Imu imu_msg{};
+ros_Odometry odom_msg{};
+ros_Float32MultiArray motor_state_msg{};
 float motor_state_data[7];
-
-rcl_interfaces__msg__Log log_msg;
-bool rosout_pub_initialized = false;
-int64_t last_time_sync_ms = 0;
 
 volatile long ticks_L = 0;
 volatile long ticks_R = 0;
@@ -172,51 +134,20 @@ PID motor_right_pid(&right_measured_rpm, &right_cmd, &right_target_rpm, Kp_R,
 Motor motor_left(BIN1, BIN2, PWMB, -1, STBY, 20000, 8, 2);
 Motor motor_right(AIN1, AIN2, PWMA, -1, STBY, 20000, 8, 1);
 
-int64_t last_agent_ok_ms = 0;
-
-void log_message(uint8_t level, const char *name, const char *msg) {
-  if (!rosout_pub_initialized) {
-    return;
-  }
-
-  log_msg.level = level;
-
-  log_msg.name.data = (char *)name;
-  log_msg.name.size = strlen(name);
-  log_msg.name.capacity = strlen(name) + 1;
-
-  log_msg.msg.data = (char *)msg;
-  log_msg.msg.size = strlen(msg);
-  log_msg.msg.capacity = strlen(msg) + 1;
-
-  log_msg.function.data = (char *)"";
-  log_msg.function.size = 0;
-  log_msg.function.capacity = 1;
-
-  log_msg.file.data = (char *)"";
-  log_msg.file.size = 0;
-  log_msg.file.capacity = 1;
-
-  log_msg.line = 0;
-
-  rcl_ret_t ret = rcl_publish(&rosout_pub, &log_msg, NULL);
-  (void)ret;
-}
-
 void log_info(const char *msg) {
-  log_message(rcl_interfaces__msg__Log__INFO, "turtlebot_lowlevel_node", msg);
+  transport.log(20, msg);
 }
 
 void log_warn(const char *msg) {
-  log_message(rcl_interfaces__msg__Log__WARN, "turtlebot_lowlevel_node", msg);
+  transport.log(30, msg);
 }
 
 void log_error(const char *msg) {
-  log_message(rcl_interfaces__msg__Log__ERROR, "turtlebot_lowlevel_node", msg);
+  transport.log(40, msg);
 }
 
 void log_debug(const char *msg) {
-  log_message(rcl_interfaces__msg__Log__DEBUG, "turtlebot_lowlevel_node", msg);
+  transport.log(10, msg);
 }
 
 // ===== Encoder ISRs =====
@@ -230,11 +161,8 @@ void isrRight() {
   ++encoder_events;
 }
 
-// ===== Timer callback (50 Hz) =====
-void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-  (void)last_call_time;
-  if (timer == NULL)
-    return;
+// ===== IMU sampling (20 Hz) =====
+void imu_timer_callback() {
 
   sensors_event_t a, g, temp;
   imu.getEvent(&a, &g, &temp);
@@ -253,9 +181,8 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   // Do not let the EKF or hardware readiness consume uncalibrated gyro data.
   if (!gyro_calibration.ready()) return;
 
-  if (!rmw_uros_epoch_synchronized() ||
-      esp_timer_get_time() / 1000 - last_time_sync_ms > 120000) return;
-  const int64_t stamp = rmw_uros_epoch_nanos();
+  int64_t stamp;
+  if (!transport.epoch(stamp)) return;
   imu_msg.header.stamp.sec = stamp / 1000000000;
   imu_msg.header.stamp.nanosec = stamp % 1000000000;
   imu_msg.linear_acceleration.x = a.acceleration.x;
@@ -265,8 +192,7 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   imu_msg.angular_velocity.y = g.gyro.y - gyro_calibration.bias(1);
   imu_msg.angular_velocity.z = g.gyro.z - gyro_calibration.bias(2);
 
-  rcl_ret_t ret = rcl_publish(&imu_pub, &imu_msg, NULL);
-  (void)ret; // Suppress unused warning
+  transport.publish(imu_msg);
 }
 
 static int64_t now_ms(void) { return (esp_timer_get_time() / 1000); }
@@ -279,22 +205,10 @@ static float normalize_angle(float a) {
   return a;
 }
 
-void agent_alive_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-  (void)last_call_time;
-  if (timer == NULL)
-    return;
-
-  if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
-    last_agent_ok_ms = now_ms();
-  }
-}
-
 // PID tuning callback - receives array [Kp_L, Ki_L, Kd_L, Kp_R, Ki_R, Kd_R]
-void pid_tune_callback(const void *msgin) {
-  const std_msgs__msg__Float32MultiArray *msg =
-      (const std_msgs__msg__Float32MultiArray *)msgin;
+void pid_tune_callback(const ros_Float32MultiArray *msg) {
 
-  if (msg->data.size == 3) {
+  if (msg->data.n_elements == 3) {
     const double kp = msg->data.data[0];
     const double ki = msg->data.data[1];
     const double kd = msg->data.data[2];
@@ -308,7 +222,7 @@ void pid_tune_callback(const void *msgin) {
     return;
   }
 
-  if (msg->data.size >= 6) {
+  if (msg->data.n_elements >= 6) {
     const double kpL = msg->data.data[0];
     const double kiL = msg->data.data[1];
     const double kdL = msg->data.data[2];
@@ -327,15 +241,8 @@ void pid_tune_callback(const void *msgin) {
   }
 }
 
-void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-
-  (void)last_call_time;
-
-  if (timer == NULL)
-    return;
-
-  // Compute dt from a monotonic clock. The rclc `last_call_time` argument is
-  // not guaranteed to be a period; treating it as dt can break odometry.
+void motor_timer_callback() {
+  // Compute dt from actual monotonic elapsed time, including scheduling jitter.
   static int64_t last_motor_us = 0;
   const int64_t now_us = esp_timer_get_time();
   if (last_motor_us == 0) {
@@ -386,7 +293,8 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
   // -------- Publish Odometry --------
   // Get current time in nanoseconds
-  int64_t time_ns = rmw_uros_epoch_nanos();
+  int64_t time_ns = 0;
+  const bool synchronized = transport.epoch(time_ns);
 
   // Populate odometry message
   odom_msg.header.stamp.sec = time_ns / 1000000000;
@@ -413,10 +321,7 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   odom_msg.twist.twist.angular.z = w_odom;
 
   // Publish odometry
-  rcl_ret_t odom_ret = RCL_RET_OK;
-  if (rmw_uros_epoch_synchronized() && now_ms() - last_time_sync_ms <= 120000)
-    odom_ret = rcl_publish(&odom_pub, &odom_msg, NULL);
-  (void)odom_ret; // Suppress unused warning
+  if (synchronized) transport.publish(odom_msg);
 
   // -------- RPM --------
   left_measured_rpm = fabs((dsL / WHEEL_CIRC) / dt * 60.0f);
@@ -429,7 +334,8 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
        (now_ms() - last_cmd_vel_ms) > CMD_VEL_TIMEOUT_MS);
   const bool targets_zero = ((fabs(left_target_rpm_req) < TARGET_RPM_EPS) &&
                              (fabs(right_target_rpm_req) < TARGET_RPM_EPS));
-  const bool robot_stopped = cmd_timed_out || targets_zero || dt > 0.5f;
+  const bool robot_stopped = cmd_timed_out || targets_zero || dt > 0.5f ||
+                             transport.should_stop(gyro_calibration.ready());
 
   // Slew-limit the actual PID setpoints towards the requested targets.
   const float max_delta_rpm = TARGET_RPM_RAMP_PER_S * dt;
@@ -554,13 +460,10 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   motor_state_data[4] = pwm_l;
   motor_state_data[5] = pwm_r;
   motor_state_data[6] = dt;
-  rcl_ret_t motor_state_ret = rcl_publish(&motor_state_pub, &motor_state_msg, NULL);
-  (void)motor_state_ret;
+  transport.publish(motor_state_msg);
 }
 
-void cmd_vel_callback(const void *msgin) {
-  const geometry_msgs__msg__TwistStamped *msg =
-      (const geometry_msgs__msg__TwistStamped *)msgin;
+void cmd_vel_callback(const ros_TwistStamped *msg) {
 
   float v = msg->twist.linear.x;
   if (!isfinite(v) || !isfinite(msg->twist.angular.z)) {
@@ -634,203 +537,81 @@ void setup() {
   motor_left_pid.SetMode(AUTOMATIC);
   motor_right_pid.SetMode(AUTOMATIC);
 
-  Serial.begin(COM_RATE);
-
-  // Initialize micro-ROS serial transport
-  set_microros_serial_transports(Serial);
-
-  // wait for agent
-  while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
-    delay(1000);
-  }
-  last_agent_ok_ms = now_ms();
-
-  // start watchdog
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL);
-
   // try to initialize IMU
   Wire.begin(SDA_PIN, SCL_PIN);
   if (!imu.begin()) {
-    RCUTILS_LOG_ERROR("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+    digitalWrite(STBY, LOW);
+    delay(1000);
+    esp_restart();
   }
 
-  // Reset Watchdog to be save - don't know if it helps
-  esp_task_wdt_reset();
-
-  // Allocator & support
-  rcl_allocator_t allocator = rcl_get_default_allocator();
-
-  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
-  rcl_ret_t ret = rcl_init_options_init(&init_options, allocator);
-  (void)ret;
-  ret = rcl_init_options_set_domain_id(&init_options, ROS_DOMAIN_ID);
-  (void)ret;
-  rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
-
-  // Synchronize the MCU clock with the agent on the Pi, before publishing data.
-  while (rmw_uros_sync_session(100) != RMW_RET_OK) {
-    esp_task_wdt_reset();
-    delay(100);
-  }
-  last_time_sync_ms = now_ms();
-
-  // Create node
-  rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
-
-  // Initialize rosout publisher with system default QoS (transient local,
-  // reliable)
-  rmw_qos_profile_t rosout_qos = rmw_qos_profile_system_default;
-  rosout_qos.depth = 10;
-  rosout_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
-  rosout_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
-
-  rcl_publisher_options_t rosout_pub_options =
-      rcl_publisher_get_default_options();
-  rosout_pub_options.qos = rosout_qos;
-
-  ret = rcl_publisher_init(
-      &rosout_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(rcl_interfaces, msg, Log),
-      "/rosout", &rosout_pub_options);
-  (void)ret;
-
-  // Initialize log message
-  rcl_interfaces__msg__Log__init(&log_msg);
-  rosout_pub_initialized = true;
-
-  log_info("Node initialized");
-
-  // IMU publisher
-  rmw_qos_profile_t sensor_qos = rmw_qos_profile_sensor_data; // best-effort
-  sensor_qos.depth = 5;
-  rcl_publisher_options_t sensor_pub_options =
-      rcl_publisher_get_default_options();
-  sensor_pub_options.qos = sensor_qos;
-
-  rcl_publisher_options_t imu_options = sensor_pub_options;
-  // Imu exceeds the best-effort XRCE MTU; reliable streams allow fragmentation.
-  imu_options.qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
-  ret = rcl_publisher_init(
-      &imu_pub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data",
-      &imu_options);
-  (void)ret;
-
-  rmw_uros_set_publisher_session_timeout(rcl_publisher_get_rmw_handle(&imu_pub), 0);
-  sensor_msgs__msg__Imu__init(&imu_msg);
-  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
+  imu_msg.header.frame_id = const_cast<char*>("imu_link");
   imu_msg.orientation_covariance[0] = -1.0; // MPU6050 has no absolute heading.
   for (int i = 0; i < 9; i += 4) {
     imu_msg.angular_velocity_covariance[i] = 0.0004; // (0.02 rad/s)^2
     imu_msg.linear_acceleration_covariance[i] = 0.04; // (0.2 m/s^2)^2
   }
 
-  log_info("IMU publisher initialized");
-
-  ret = rcl_publisher_init(
-      &motor_state_pub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-      "motor/state", &sensor_pub_options);
-  (void)ret;
   motor_state_msg.data.data = motor_state_data;
-  motor_state_msg.data.size = 7;
-  motor_state_msg.data.capacity = 7;
-
-  // Odometry publisher
-  // Odometry exceeds the best-effort transport MTU; reliable XRCE streams
-  // support fragmentation. Do not wait for acknowledgements in the control loop.
-  rcl_publisher_options_t odom_pub_options = sensor_pub_options;
-  odom_pub_options.qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
-  ret = rcl_publisher_init(&odom_pub, &node,
-                           ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-                           "odom", &odom_pub_options);
-  (void)ret;
-  rmw_uros_set_publisher_session_timeout(rcl_publisher_get_rmw_handle(&odom_pub), 0);
-
-  // Initialize odometry message
-  nav_msgs__msg__Odometry__init(&odom_msg);
-
-  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
-  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+  motor_state_msg.data.n_elements = 7;
+  odom_msg.header.frame_id = const_cast<char*>("odom");
+  odom_msg.child_frame_id = const_cast<char*>("base_link");
   // EKF fuses velocities only; these are initial tuning values, not calibration.
   odom_msg.twist.covariance[0] = 0.0025;
   odom_msg.twist.covariance[7] = 0.0025;
   odom_msg.twist.covariance[35] = 0.01;
 
-  log_info("Odometry publisher initialized");
-
-  rclc_timer_init_default2(&imu_timer, &support,
-                           RCL_MS_TO_NS(IMU_UPDATE_RATE_MS), imu_timer_callback,
-                           true);
-
-  rclc_timer_init_default2(&agent_alive_timer, &support,
-                           RCL_MS_TO_NS(AGENT_ALIVE_CHECK_MS),
-                           agent_alive_timer_callback, true);
-  rclc_timer_init_default2(&motor_timer, &support,
-                           RCL_MS_TO_NS(MOTOR_CONTROL_RATE_MS),
-                           motor_timer_callback, true);
-
-  // Reset Watchdog to be save - don't know if it helps
-  esp_task_wdt_reset();
-
-  // Initialize PID tuning message
-  pid_tune_msg.data.capacity = 6;
-  pid_tune_msg.data.size = 0;
-  pid_tune_msg.data.data = (float *)malloc(6 * sizeof(float));
-
-  rclc_executor_init(&executor, &support.context,
-                     TIMER_COUNT + SUBSCRIPTION_COUNT, &allocator);
-  rclc_executor_add_timer(&executor, &agent_alive_timer);
-  rclc_executor_add_timer(&executor, &imu_timer);
-  rclc_executor_add_timer(&executor, &motor_timer);
-
-  // cmd_vel subscriber
-  rmw_qos_profile_t cmd_qos = rmw_qos_profile_sensor_data; // best-effort
-  cmd_qos.depth = 1;
-  rcl_subscription_options_t cmd_sub_options =
-      rcl_subscription_get_default_options();
-  cmd_sub_options.qos = cmd_qos;
-  ret = rcl_subscription_init(
-      &cmd_vel_sub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped), "cmd_vel",
-      &cmd_sub_options);
-  (void)ret;
-  rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
-                                 &cmd_vel_callback, ON_NEW_DATA);
-
-  // PID tuning subscriber
-  rclc_subscription_init_default(
-      &pid_tune_sub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-      "pid_tune");
-  rclc_executor_add_subscription(&executor, &pid_tune_sub, &pid_tune_msg,
-                                 &pid_tune_callback, ON_NEW_DATA);
-
-  log_info("System initialization complete");
-  log_info("Ready to receive commands");
+  // UART0 is exclusively owned by Zenoh; never print text to Serial here.
+  if (!transport.begin()) {
+    digitalWrite(STBY, LOW);
+    delay(1000);
+    esp_restart();
+  }
+  // A separate communication task prevents a congested serial connection from
+  // delaying motor regulation or its 500 ms command watchdog.
+  if (xTaskCreate([](void*) {
+        for (;;) { transport.service(); vTaskDelay(pdMS_TO_TICKS(5)); }
+      }, "picoros_tx", 8192, nullptr, 1, nullptr) != pdPASS) {
+    digitalWrite(STBY, LOW);
+    esp_restart();
+  }
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+  log_info("Pico-ROS initialized; waiting for clock, mode heartbeat and gyro calibration");
 }
 
 // ---------------- Arduino loop ----------------
 void loop() {
-  static int64_t last_sync_attempt_ms = 0;
-  if (now_ms() - last_sync_attempt_ms > 30000) {
-    last_sync_attempt_ms = now_ms();
-    if (rmw_uros_sync_session(10) == RMW_RET_OK) last_time_sync_ms = now_ms();
+  static int64_t last_imu_ms = 0, last_motor_ms = 0;
+  static int64_t started_ms = now_ms();
+  if (transport.command(cmd_vel_msg, gyro_calibration.ready())) cmd_vel_callback(&cmd_vel_msg);
+  if (transport.should_stop(gyro_calibration.ready())) {
+    left_target_rpm_req = right_target_rpm_req = 0.0;
+    motor_left.brake();
+    motor_right.brake();
   }
-  if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(EXECUTOR_SPIN_RATE_MS)) !=
-
-      RCL_RET_OK) {
-    delay(1);
+  float gains[6];
+  size_t count;
+  if (transport.tuning(gains, count)) {
+    ros_Float32MultiArray msg{};
+    msg.data.data = gains; msg.data.n_elements = count;
+    pid_tune_callback(&msg);
   }
-
-  if (now_ms() - last_agent_ok_ms > AGENT_DEAD_TIMEOUT_MS) {
-    log_error("Agent connection lost - restarting");
-    delay(100); // Give time for log to be sent
+  const int64_t now = now_ms();
+  if (now - last_motor_ms >= MOTOR_CONTROL_RATE_MS) {
+    last_motor_ms = now;
+    motor_timer_callback();
+  }
+  if (now - last_imu_ms >= IMU_UPDATE_RATE_MS) {
+    last_imu_ms = now;
+    imu_timer_callback();
+  }
+  if (now - started_ms > 10000 && !transport.alive()) {
+    motor_left.brake();
+    motor_right.brake();
+    digitalWrite(STBY, LOW);
     esp_restart();
-  } else {
-    esp_task_wdt_reset();
   }
+  esp_task_wdt_reset();
+  delay(1);
 }
