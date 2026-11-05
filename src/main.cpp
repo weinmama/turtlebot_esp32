@@ -12,6 +12,8 @@
 
 #include <geometry_msgs/msg/twist_stamped.h>
 #include <nav_msgs/msg/odometry.h>
+#include <sensor_msgs/msg/imu.h>
+#include <rosidl_runtime_c/string_functions.h>
 #include <rcl_interfaces/msg/log.h>
 #include <std_msgs/msg/float32_multi_array.h>
 
@@ -26,8 +28,8 @@
 #define AGENT_ALIVE_CHECK_MS 500   // Milliseconds
 #define MOTOR_CONTROL_RATE_MS 100  // Milliseconds
 #define EXECUTOR_SPIN_RATE_MS 5    // Milliseconds
-#define IMU_UPDATE_RATE_MS 20      // Milliseconds
-#define COM_RATE 115200
+#define IMU_UPDATE_RATE_MS 50      // Milliseconds (20 Hz)
+#define COM_RATE 460800
 #define ROS_DOMAIN_ID 1
 
 // High-rate /rosout logging from the motor control loop can stall the serial
@@ -81,13 +83,14 @@ rcl_subscription_t pid_tune_sub;
 
 geometry_msgs__msg__TwistStamped cmd_vel_msg;
 std_msgs__msg__Float32MultiArray pid_tune_msg;
-std_msgs__msg__Float32MultiArray imu_msg;
+sensor_msgs__msg__Imu imu_msg;
 nav_msgs__msg__Odometry odom_msg;
 std_msgs__msg__Float32MultiArray motor_state_msg;
 float motor_state_data[7];
 
 rcl_interfaces__msg__Log log_msg;
 bool rosout_pub_initialized = false;
+int64_t last_time_sync_ms = 0;
 
 volatile long ticks_L = 0;
 volatile long ticks_R = 0;
@@ -231,12 +234,17 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   sensors_event_t a, g, temp;
   imu.getEvent(&a, &g, &temp);
 
-  imu_msg.data.data[0] = a.acceleration.x;
-  imu_msg.data.data[1] = a.acceleration.y;
-  imu_msg.data.data[2] = a.acceleration.z;
-  imu_msg.data.data[3] = g.gyro.x;
-  imu_msg.data.data[4] = g.gyro.y;
-  imu_msg.data.data[5] = g.gyro.z;
+  if (!rmw_uros_epoch_synchronized() ||
+      esp_timer_get_time() / 1000 - last_time_sync_ms > 120000) return;
+  const int64_t stamp = rmw_uros_epoch_nanos();
+  imu_msg.header.stamp.sec = stamp / 1000000000;
+  imu_msg.header.stamp.nanosec = stamp % 1000000000;
+  imu_msg.linear_acceleration.x = a.acceleration.x;
+  imu_msg.linear_acceleration.y = a.acceleration.y;
+  imu_msg.linear_acceleration.z = a.acceleration.z;
+  imu_msg.angular_velocity.x = g.gyro.x;
+  imu_msg.angular_velocity.y = g.gyro.y;
+  imu_msg.angular_velocity.z = g.gyro.z;
 
   rcl_ret_t ret = rcl_publish(&imu_pub, &imu_msg, NULL);
   (void)ret; // Suppress unused warning
@@ -386,7 +394,9 @@ void motor_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   odom_msg.twist.twist.angular.z = w_odom;
 
   // Publish odometry
-  rcl_ret_t odom_ret = rcl_publish(&odom_pub, &odom_msg, NULL);
+  rcl_ret_t odom_ret = RCL_RET_OK;
+  if (rmw_uros_epoch_synchronized() && now_ms() - last_time_sync_ms <= 120000)
+    odom_ret = rcl_publish(&odom_pub, &odom_msg, NULL);
   (void)odom_ret; // Suppress unused warning
 
   // -------- RPM --------
@@ -642,6 +652,13 @@ void setup() {
   (void)ret;
   rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
 
+  // Synchronize the MCU clock with the agent on the Pi, before publishing data.
+  while (rmw_uros_sync_session(100) != RMW_RET_OK) {
+    esp_task_wdt_reset();
+    delay(100);
+  }
+  last_time_sync_ms = now_ms();
+
   // Create node
   rclc_node_init_default(&node, "turtlebot_lowlevel_node", "", &support);
 
@@ -674,15 +691,23 @@ void setup() {
       rcl_publisher_get_default_options();
   sensor_pub_options.qos = sensor_qos;
 
+  rcl_publisher_options_t imu_options = sensor_pub_options;
+  // Imu exceeds the best-effort XRCE MTU; reliable streams allow fragmentation.
+  imu_options.qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
   ret = rcl_publisher_init(
       &imu_pub, &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray), "imu/data",
-      &sensor_pub_options);
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data",
+      &imu_options);
   (void)ret;
 
-  imu_msg.data.capacity = 6;
-  imu_msg.data.size = 6;
-  imu_msg.data.data = (float *)malloc(6 * sizeof(float));
+  rmw_uros_set_publisher_session_timeout(rcl_publisher_get_rmw_handle(&imu_pub), 0);
+  sensor_msgs__msg__Imu__init(&imu_msg);
+  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
+  imu_msg.orientation_covariance[0] = -1.0; // MPU6050 has no absolute heading.
+  for (int i = 0; i < 9; i += 4) {
+    imu_msg.angular_velocity_covariance[i] = 0.0004; // (0.02 rad/s)^2
+    imu_msg.linear_acceleration_covariance[i] = 0.04; // (0.2 m/s^2)^2
+  }
 
   log_info("IMU publisher initialized");
 
@@ -709,16 +734,12 @@ void setup() {
   // Initialize odometry message
   nav_msgs__msg__Odometry__init(&odom_msg);
 
-  // Set frame IDs (manually allocate and copy strings)
-  odom_msg.header.frame_id.data = (char *)malloc(5);
-  strcpy(odom_msg.header.frame_id.data, "odom");
-  odom_msg.header.frame_id.size = 4;
-  odom_msg.header.frame_id.capacity = 5;
-
-  odom_msg.child_frame_id.data = (char *)malloc(19);
-  strcpy(odom_msg.child_frame_id.data, "base_footprint");
-  odom_msg.child_frame_id.size = 14;
-  odom_msg.child_frame_id.capacity = 19;
+  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
+  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+  // EKF fuses velocities only; these are initial tuning values, not calibration.
+  odom_msg.twist.covariance[0] = 0.0025;
+  odom_msg.twist.covariance[7] = 0.0025;
+  odom_msg.twist.covariance[35] = 0.01;
 
   log_info("Odometry publisher initialized");
 
@@ -775,6 +796,11 @@ void setup() {
 
 // ---------------- Arduino loop ----------------
 void loop() {
+  static int64_t last_sync_attempt_ms = 0;
+  if (now_ms() - last_sync_attempt_ms > 30000) {
+    last_sync_attempt_ms = now_ms();
+    if (rmw_uros_sync_session(10) == RMW_RET_OK) last_time_sync_ms = now_ms();
+  }
   if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(EXECUTOR_SPIN_RATE_MS)) !=
 
       RCL_RET_OK) {
