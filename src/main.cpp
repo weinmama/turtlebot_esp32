@@ -21,6 +21,7 @@
 #include "esp_task_wdt.h"
 #include <PID_v1.h>
 #include <TB6612_ESP32.h>
+#include "gyro_calibration.h"
 
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
@@ -94,6 +95,8 @@ int64_t last_time_sync_ms = 0;
 
 volatile long ticks_L = 0;
 volatile long ticks_R = 0;
+volatile unsigned long encoder_events = 0;
+GyroCalibration gyro_calibration;
 
 /************** Robot Parameter **************/
 const float WHEEL_RADIUS = 0.034f;
@@ -220,9 +223,11 @@ void log_debug(const char *msg) {
 
 void isrLeft() {
   ticks_L += ENC_DIR_L * ((digitalRead(ENC_B_L) == HIGH) ? 1 : -1);
+  ++encoder_events;
 }
 void isrRight() {
   ticks_R += ENC_DIR_R * ((digitalRead(ENC_B_R) == HIGH) ? 1 : -1);
+  ++encoder_events;
 }
 
 // ===== Timer callback (50 Hz) =====
@@ -234,6 +239,20 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   sensors_event_t a, g, temp;
   imu.getEvent(&a, &g, &temp);
 
+  static unsigned long previous_encoder_events = 0;
+  noInterrupts();
+  const unsigned long current_encoder_events = encoder_events;
+  interrupts();
+  const float acceleration = sqrtf(a.acceleration.x * a.acceleration.x +
+      a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z);
+  const bool stationary = current_encoder_events == previous_encoder_events &&
+      fabs(left_target_rpm_req) < TARGET_RPM_EPS && fabs(right_target_rpm_req) < TARGET_RPM_EPS &&
+      std::isfinite(acceleration) && fabsf(acceleration - 9.81f) < 1.0f;
+  previous_encoder_events = current_encoder_events;
+  gyro_calibration.sample(g.gyro.x, g.gyro.y, g.gyro.z, stationary);
+  // Do not let the EKF or hardware readiness consume uncalibrated gyro data.
+  if (!gyro_calibration.ready()) return;
+
   if (!rmw_uros_epoch_synchronized() ||
       esp_timer_get_time() / 1000 - last_time_sync_ms > 120000) return;
   const int64_t stamp = rmw_uros_epoch_nanos();
@@ -242,9 +261,9 @@ void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   imu_msg.linear_acceleration.x = a.acceleration.x;
   imu_msg.linear_acceleration.y = a.acceleration.y;
   imu_msg.linear_acceleration.z = a.acceleration.z;
-  imu_msg.angular_velocity.x = g.gyro.x;
-  imu_msg.angular_velocity.y = g.gyro.y;
-  imu_msg.angular_velocity.z = g.gyro.z;
+  imu_msg.angular_velocity.x = g.gyro.x - gyro_calibration.bias(0);
+  imu_msg.angular_velocity.y = g.gyro.y - gyro_calibration.bias(1);
+  imu_msg.angular_velocity.z = g.gyro.z - gyro_calibration.bias(2);
 
   rcl_ret_t ret = rcl_publish(&imu_pub, &imu_msg, NULL);
   (void)ret; // Suppress unused warning
