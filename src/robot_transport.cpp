@@ -148,7 +148,8 @@ bool RobotTransport::command(ros_TwistStamped& result, bool sensors_ready) {
   if (stamp <= last_command_stamp_[source]) return false;
   if (!guard_.accept(source ? PicoRosCommandGuard::Source::navigation : PicoRosCommandGuard::Source::manual,
                      current.message.twist.linear.x, current.message.twist.angular.z,
-                     epoch_ns - stamp, current.received_ns / 1000000, clock_valid, sensors_ready)) return false;
+                     epoch_ns - stamp, now / 1000000, clock_valid, sensors_ready,
+                     current.received_ns / 1000000)) return false;
   last_command_stamp_[source] = stamp;
   result = current.message;
   return true;

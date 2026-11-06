@@ -25,4 +25,11 @@ int main() {
   assert(g.should_stop(701, true, true));
   g.invalidate();
   assert(g.should_stop(701, true, true));
+  // A heartbeat can arrive after the command but before the control task runs.
+  // Validate heartbeat against processing time, timeout against receive time.
+  g.heartbeat(Guard::Mode::mapping, 1005);
+  assert(g.accept(Guard::Source::manual, 0.1f, 0, 0, 1010, true, true, 1000));
+  g.heartbeat(Guard::Mode::mapping, 1490);
+  assert(!g.should_stop(1500, true, true));
+  assert(g.should_stop(1501, true, true));
 }

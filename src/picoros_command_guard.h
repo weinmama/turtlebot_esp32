@@ -24,15 +24,17 @@ class PicoRosCommandGuard {
   }
 
   bool accept(Source source, float linear, float angular, int64_t command_age_ns,
-              int64_t now_ms, bool clock_valid, bool sensors_ready) {
+              int64_t now_ms, bool clock_valid, bool sensors_ready, int64_t received_ms = -1) {
+    if (received_ms < 0) received_ms = now_ms;
     if (!clock_valid || !sensors_ready || !has_heartbeat_ || now_ms < heartbeat_ms_ ||
         now_ms - heartbeat_ms_ > kHeartbeatTimeoutMs || !std::isfinite(linear) ||
         !std::isfinite(angular) || command_age_ns < -kFutureToleranceNs ||
-        command_age_ns > kMaxCommandAgeNs) return false;
+        command_age_ns > kMaxCommandAgeNs || received_ms > now_ms ||
+        now_ms - received_ms > 200) return false;
     const bool permitted = source == Source::navigation ? mode_ == Mode::navigation :
                            (mode_ == Mode::mapping || mode_ == Mode::idle);
     if (!permitted) return false;
-    command_ms_ = now_ms;
+    command_ms_ = received_ms;
     has_command_ = true;
     return true;
   }

@@ -1,6 +1,7 @@
 """Build the pinned Pico-ROS libraries with the project's cross compiler."""
 from pathlib import Path
 import subprocess
+import sys
 
 Import("env")
 
@@ -10,6 +11,9 @@ zenoh = pico / "thirdparty/zenoh-pico"
 if not (zenoh / "CMakeLists.txt").exists():
     raise RuntimeError("Run git submodule update --init --recursive first")
 generated = Path(env.subst("$BUILD_DIR")) / "zenoh-config"
+patched = Path(env.subst("$BUILD_DIR")) / "zenoh-patched"
+subprocess.run([sys.executable, str(root / "scripts/patch_zenoh.py"),
+                str(zenoh / "src/transport/unicast/rx.c"), str(patched / "rx.c")], check=True)
 subprocess.run([
     "cmake", "-S", str(zenoh), "-B", str(generated),
     "-DZP_PLATFORM=arduino_esp32", "-DBUILD_EXAMPLES=OFF", "-DBUILD_TESTING=OFF",
@@ -24,7 +28,9 @@ env.Append(CPPPATH=[str(generated / "include"), str(zenoh / "include"),
 env.BuildSources("$BUILD_DIR/zenoh", str(zenoh / "src"), src_filter=[
     "+<*>", "-<system/>", "+<system/common/>", "+<system/socket/>",
     "+<system/arduino/esp32/>", "-<link/transport/tcp/>", "-<link/transport/udp/>",
+    "-<transport/unicast/rx.c>",
 ])
+env.BuildSources("$BUILD_DIR/zenoh-patched-objects", str(patched))
 env.BuildSources("$BUILD_DIR/picoros", str(pico / "src"),
                  src_filter=["+<picoros.c>", "+<picoserdes.c>"])
 env.BuildSources("$BUILD_DIR/microcdr", str(pico / "thirdparty/Micro-CDR/src/c"))

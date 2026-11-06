@@ -59,6 +59,7 @@ volatile long ticks_L = 0;
 volatile long ticks_R = 0;
 volatile unsigned long encoder_events = 0;
 GyroCalibration gyro_calibration;
+int64_t last_imu_valid_ms = 0, last_odom_valid_ms = 0;
 
 /************** Robot Parameter **************/
 const float WHEEL_RADIUS = 0.034f;
@@ -178,6 +179,8 @@ void imu_timer_callback() {
       std::isfinite(acceleration) && fabsf(acceleration - 9.81f) < 1.0f;
   previous_encoder_events = current_encoder_events;
   gyro_calibration.sample(g.gyro.x, g.gyro.y, g.gyro.z, stationary);
+  if (!std::isfinite(acceleration) || !std::isfinite(g.gyro.x) ||
+      !std::isfinite(g.gyro.y) || !std::isfinite(g.gyro.z)) return;
   // Do not let the EKF or hardware readiness consume uncalibrated gyro data.
   if (!gyro_calibration.ready()) return;
 
@@ -192,10 +195,17 @@ void imu_timer_callback() {
   imu_msg.angular_velocity.y = g.gyro.y - gyro_calibration.bias(1);
   imu_msg.angular_velocity.z = g.gyro.z - gyro_calibration.bias(2);
 
+  last_imu_valid_ms = esp_timer_get_time() / 1000;
   transport.publish(imu_msg);
 }
 
 static int64_t now_ms(void) { return (esp_timer_get_time() / 1000); }
+
+static bool sensors_ready() {
+  const int64_t now = now_ms();
+  return gyro_calibration.ready() && last_imu_valid_ms && last_odom_valid_ms &&
+         now - last_imu_valid_ms <= 1000 && now - last_odom_valid_ms <= 1000;
+}
 
 static float normalize_angle(float a) {
   while (a > PI)
@@ -321,7 +331,11 @@ void motor_timer_callback() {
   odom_msg.twist.twist.angular.z = w_odom;
 
   // Publish odometry
-  if (synchronized) transport.publish(odom_msg);
+  if (synchronized && std::isfinite(v_odom) && std::isfinite(w_odom) &&
+      std::isfinite(x) && std::isfinite(y) && std::isfinite(theta)) {
+    last_odom_valid_ms = now_ms();
+    transport.publish(odom_msg);
+  }
 
   // -------- RPM --------
   left_measured_rpm = fabs((dsL / WHEEL_CIRC) / dt * 60.0f);
@@ -335,7 +349,7 @@ void motor_timer_callback() {
   const bool targets_zero = ((fabs(left_target_rpm_req) < TARGET_RPM_EPS) &&
                              (fabs(right_target_rpm_req) < TARGET_RPM_EPS));
   const bool robot_stopped = cmd_timed_out || targets_zero || dt > 0.5f ||
-                             transport.should_stop(gyro_calibration.ready());
+                             transport.should_stop(sensors_ready());
 
   // Slew-limit the actual PID setpoints towards the requested targets.
   const float max_delta_rpm = TARGET_RPM_RAMP_PER_S * dt;
@@ -562,6 +576,10 @@ void setup() {
   odom_msg.twist.covariance[35] = 0.01;
 
   // UART0 is exclusively owned by Zenoh; never print text to Serial here.
+  // The upstream serial handshake blocks if the Pi is absent. Include startup
+  // in the watchdog so a lost INIT cannot leave the MCU waiting indefinitely.
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
   if (!transport.begin()) {
     digitalWrite(STBY, LOW);
     delay(1000);
@@ -575,8 +593,7 @@ void setup() {
     digitalWrite(STBY, LOW);
     esp_restart();
   }
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
   log_info("Pico-ROS initialized; waiting for clock, mode heartbeat and gyro calibration");
 }
 
@@ -584,8 +601,8 @@ void setup() {
 void loop() {
   static int64_t last_imu_ms = 0, last_motor_ms = 0;
   static int64_t started_ms = now_ms();
-  if (transport.command(cmd_vel_msg, gyro_calibration.ready())) cmd_vel_callback(&cmd_vel_msg);
-  if (transport.should_stop(gyro_calibration.ready())) {
+  if (transport.command(cmd_vel_msg, sensors_ready())) cmd_vel_callback(&cmd_vel_msg);
+  if (transport.should_stop(sensors_ready())) {
     left_target_rpm_req = right_target_rpm_req = 0.0;
     motor_left.brake();
     motor_right.brake();
