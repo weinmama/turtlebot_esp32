@@ -1,60 +1,29 @@
-+---------------------------+
-| Entwicklungsrechner       |
-|                           |
-| VS Code                   |
-| PlatformIO Devcontainer   |
-|  - Build ESP32 Firmware   |
-|  - Quellcode & Debug      |
-+-------------+-------------+
-              |
-        SSH / rsync / scp
-              |
-+-------------v-------------+
-| Raspberry Pi              |
-|                           |
-| ROS 2                     |
-| micro-ROS Agent (Docker)  |
-| USB: /dev/ttyUSB0         |
-|                           |
-| ESP32 (micro-ROS Client)  |
-+---------------------------+
+# Turtlebot ESP32 – Pico-ROS / Zenoh
 
+Dieser Branch verwendet **Pico-ROS über die vorhandene serielle Verbindung**
+(UART0, 460800 Baud). Der Pi benötigt einen seriellen Zenoh-Router und den
+mitgelieferten Zeitdienst. Der micro-ROS-Agent und die DDS/Zenoh-Bridge entfallen.
 
+**Build, Pi-Umstellung, Flashen und ROS-Kommandos:** [PICOROS_PORT.md](PICOROS_PORT.md).
 
-# Raspberry
-
-```
-docker run -it --rm   --net=host   \
-  --device=/dev/ttyUSB1:/dev/ttyUSB1   \
-  microros/micro-ros-agent:jazzy  \
-  -vvv serial --dev /dev/ttyUSB1 115200
-
+```text
+ESP32 (Pico-ROS) ← USB/seriell → Pi (Zenoh-Router) ←→ ROS / EKF / Nav2 / UI
 ```
 
-``` 
-docker run -it --rm   --net=host   --device=/dev/ttyUSB1   microros/micro-ros-agent:jazzy   serial --dev /dev/ttyUSB1 -b 115200 -v debug
+```sh
+git submodule update --init --recursive
+pio run -e esp32 -t firmware_bundle
+bash scripts/test.sh
 ```
 
+`/cmd_vel` verwendet weiterhin `geometry_msgs/msg/TwistStamped` mit aktuellem
+Zeitstempel. Radodometrie kommt direkt auf `/wheel/odom`; IMU auf `/imu/data`.
+Modus-Heartbeat, gültige Zeitbasis und abgeschlossene stationäre
+Gyro-Kalibrierung sind Voraussetzung für Fahrbefehle.
 
-## remote deployment on the raspberry pi
+## Motorregelung
 
-Im Turtlebox-Hauptrepository vom Entwicklungsrechner aus:
-
-```bash
-mise run deploy:esp32
-```
-
-Dies baut lokal und flasht alle benötigten Images per SSH auf `robot-pi`
-über `/dev/esp32`. Dokumentation: `scripts/esp32/README.md` im Hauptrepository.
-Nur bauen: `mise run build:esp32`.
-
-Tests
-
-ros2 topic pub /cmd_vel geometry_msgs/msg/TwistStamped "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: 'base_link'}, twist: {linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}}"
-
-### Motorregelung prüfen
-
-`/motor/state` ist ein Best-Effort-`Float32MultiArray` mit sieben Werten:
+`/motor/state` ist ein `Float32MultiArray` mit sieben Werten:
 vorzeichenbehaftete Soll-Drehzahl links/rechts (U/min), Encoder-Drehzahl
 links/rechts (U/min), PWM links/rechts und Regelintervall (Sekunden).
 Die aktuelle Vorsteuerung und PI-Abstimmung wurden bei aufgebocktem Roboter

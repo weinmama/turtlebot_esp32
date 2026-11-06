@@ -1,0 +1,28 @@
+name: turtlebot-picoros
+services:
+  router:
+    image: ${PICOROS_HOST_IMAGE:-turtlebox-backend:lyrical}
+    network_mode: host
+    restart: unless-stopped
+    devices:
+      - ${ESP32_DEVICE:-/dev/esp32}:/dev/esp32
+    volumes:
+      - ./router.json5:/config/router.json5:ro
+    environment:
+      ROS_DOMAIN_ID: "1"
+      ZENOH_ROUTER_CONFIG_URI: /config/router.json5
+    entrypoint: /ros_entrypoint.sh
+    command: [ros2, run, rmw_zenoh_cpp, rmw_zenohd]
+  clock:
+    image: ${PICOROS_HOST_IMAGE:-turtlebox-backend:lyrical}
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [router]
+    volumes:
+      - ./time_sync.py:/app/time_sync.py:ro
+    environment:
+      ROS_DOMAIN_ID: "1"
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'connect/endpoints=["tcp/127.0.0.1:7447"];scouting/multicast/enabled=false'
+    entrypoint: /ros_entrypoint.sh
+    command: [python3, /app/time_sync.py]
