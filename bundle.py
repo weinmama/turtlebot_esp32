@@ -12,7 +12,7 @@ def bundle(source, target, env):
     images = list(env.get("FLASH_EXTRA_IMAGES", []))
     images.append((env.subst("$ESP32_APP_OFFSET"), "$BUILD_DIR/${PROGNAME}.bin"))
     manifest = {"chip": env.BoardConfig().get("build.mcu"), "middleware": "picoros",
-                "transport": "serial/460800", "images": []}
+                "transport": "serial/250000", "images": []}
     for index, (address, filename) in enumerate(images):
         filename = Path(env.subst(str(filename)))
         name = f"{index}-{filename.name}"

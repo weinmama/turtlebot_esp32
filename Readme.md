@@ -1,7 +1,7 @@
 # Turtlebot ESP32 – Pico-ROS / Zenoh
 
 Dieser Branch verwendet **Pico-ROS über die vorhandene serielle Verbindung**
-(UART0, 460800 Baud). Der Pi benötigt einen seriellen Zenoh-Router und den
+(UART0, 250000 Baud). Der Pi benötigt den getrennten seriellen Zenoh-Router und den
 mitgelieferten Zeitdienst. Der micro-ROS-Agent und die DDS/Zenoh-Bridge entfallen.
 
 **Build, Pi-Umstellung, Flashen und ROS-Kommandos:** [PICOROS_PORT.md](PICOROS_PORT.md).

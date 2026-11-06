@@ -25,7 +25,10 @@ sys.path.insert(0, str(ROOT / "host"))
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", action="store_true")
+    parser.add_argument("--split-router", action="store_true")
     args = parser.parse_args()
+    if args.split_router and not args.serial:
+        parser.error("--split-router requires --serial")
     if os.environ.get("PICOROS_TEST_ISOLATED") != "1":
         raise RuntimeError("Run in a --network none container with PICOROS_TEST_ISOLATED=1")
     os.environ.update(ROS_DOMAIN_ID="1", RMW_IMPLEMENTATION="rmw_zenoh_cpp",
@@ -54,8 +57,10 @@ def main():
             tty.setraw(sa); tty.setraw(sb)
             # Upstream POSIX Pico driver caps its baud enum at 230400. PTYs do
             # not model baud timing; firmware UART0 and host/router.json5 use
-            # 460800. This checks real serial framing, handshake and fragments.
-            config["listen"]["endpoints"].append(f"serial/{os.ttyname(sa)}#baudrate=230400")
+            # 250000. This checks real serial framing, handshake and fragments.
+            serial_endpoint = f"serial/{os.ttyname(sa)}#baudrate=230400"
+            if not args.split_router:
+                config["listen"]["endpoints"].append(serial_endpoint)
             locator = f"serial/{os.ttyname(sb)}#baudrate=230400"
 
             def relay():
@@ -89,6 +94,20 @@ def main():
                     router_log.seek(0)
                     raise RuntimeError(router_log.read())
                 time.sleep(0.05)
+        if args.split_router:
+            edge_config = {
+                "mode": "router", "listen": {"endpoints": [serial_endpoint]},
+                "connect": {"endpoints": ["tcp/127.0.0.1:17447"]},
+                "scouting": {"multicast": {"enabled": False}},
+                "routing": {"router": {"peers_failover_brokering": True}},
+            }
+            edge_config_path = directory / "serial-router.json"
+            edge_config_path.write_text(json.dumps(edge_config))
+            edge_env = dict(env, ZENOH_ROUTER_CONFIG_URI=str(edge_config_path))
+            edge_log = (directory / "serial-router.log").open("w+")
+            edge = subprocess.Popen(["/opt/ros/lyrical/lib/rmw_zenoh_cpp/rmw_zenohd"],
+                                    env=edge_env, stdout=edge_log, stderr=subprocess.STDOUT)
+            processes.append(edge)
         lines = []
         if args.serial:
             # The router clears serial RX after its accept-loop throttle;

@@ -11,6 +11,12 @@ set(BATCH_UNICAST_SIZE 2048 CACHE STRING "" FORCE)
 set(USER_TYPE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/include/robot_types.h" CACHE STRING "" FORCE)
 add_subdirectory(thirdparty/picoros EXCLUDE_FROM_ALL)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(patched_picoros "${CMAKE_CURRENT_BINARY_DIR}/picoros-patched/picoros.c")
+execute_process(COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_picoros.py"
+  "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/picoros/src/picoros.c"
+  "${patched_picoros}" COMMAND_ERROR_IS_FATAL ANY)
+set_property(TARGET picoros PROPERTY SOURCES "${patched_picoros}")
+target_include_directories(picoros PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(patched_rx "${CMAKE_CURRENT_BINARY_DIR}/zenoh-patched/rx.c")
 execute_process(COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_zenoh.py"
   "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/picoros/thirdparty/zenoh-pico/src/transport/unicast/rx.c"
@@ -25,6 +31,10 @@ target_include_directories(robot_transport PUBLIC src include)
 target_link_libraries(robot_transport PUBLIC picoros picoserdes pthread)
 target_compile_options(robot_transport PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers)
 enable_testing()
+add_executable(test_picoros_clock_ns test/test_picoros_clock_ns.c)
+target_include_directories(test_picoros_clock_ns PRIVATE include)
+target_compile_options(test_picoros_clock_ns PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME picoros_clock_ns COMMAND test_picoros_clock_ns)
 foreach(name gyro_calibration picoros_time_sync picoros_command_guard)
   add_executable(test_${name} test/test_${name}.cpp)
   target_compile_options(test_${name} PRIVATE -Wall -Wextra -Werror -UNDEBUG)

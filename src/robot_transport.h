@@ -7,7 +7,7 @@
 #include <mutex>
 
 #ifndef ROBOT_ZENOH_LOCATOR
-#define ROBOT_ZENOH_LOCATOR "serial/UART_0#baudrate=460800"
+#define ROBOT_ZENOH_LOCATOR "serial/UART_0#baudrate=250000"
 #endif
 #ifndef ROBOT_ODOM_TOPIC
 #define ROBOT_ODOM_TOPIC "wheel/odom"

@@ -1,0 +1,7 @@
+{
+  mode: "router",
+  listen: { endpoints: ["serial//dev/esp32#baudrate=250000"] },
+  connect: { endpoints: ["tcp/127.0.0.1:7447"] },
+  scouting: { multicast: { enabled: false } },
+  routing: { router: { peers_failover_brokering: true } },
+}

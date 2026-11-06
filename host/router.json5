@@ -1,6 +1,6 @@
 {
   mode: "router",
-  listen: { endpoints: ["tcp/0.0.0.0:7447", "serial//dev/esp32#baudrate=460800"] },
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
   scouting: { multicast: { enabled: true } },
   // ROS discovery tokens must be routed between MCU and host sessions.
   routing: { router: { peers_failover_brokering: true } },

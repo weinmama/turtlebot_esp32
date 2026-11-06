@@ -30,8 +30,8 @@ after the one-time Pi migration below, use this branch's wrapper:
 bash src/hardware/turtlebot_esp32/scripts/deploy.sh   # from the backend root
 ```
 
-It builds on the desktop, stops the Pico-ROS router/clock, delegates transfer and
-verified flashing to `scripts/esp32/deploy.sh`, and restarts router/clock after a
+It builds on the desktop, stops the Pico-ROS routers/clock, delegates transfer and
+verified flashing to `scripts/esp32/deploy.sh`, and restarts them after a
 successful flash. It accepts the existing `PI_HOST`, `PI_SSH_PORT`,
 `ESP32_DEVICE`, `ESP32_UPLOAD_SPEED` and `PI_SUDO_NONINTERACTIVE` variables.
 The unwrapped old deploy command does not stop a Zenoh serial router.
@@ -47,7 +47,7 @@ Copy this branch's `host/` files from the desktop:
 
 ```sh
 ssh pi@robot-pi.local 'mkdir -p "$HOME/.local/share/turtlebox/picoros"'
-scp host/{compose.yaml,router.json5,time_sync.py} \
+scp host/{compose.yaml,router.json5,serial-router.json5,wait-router.sh,time_sync.py} \
   pi@robot-pi.local:.local/share/turtlebox/picoros/
 ```
 
@@ -57,16 +57,21 @@ On the Pi, using the desktop-built backend image already installed there:
 sudo systemctl disable --now turtlebox-hardware@microros-agent.service \
   turtlebox-hardware@bridge.service
 cd "$HOME/.local/share/turtlebox/picoros"
-docker compose config --quiet
+docker-compose config --quiet
 # Flash from the desktop using the wrapper above; it starts these services.
 # For an already-flashed MCU:
-docker compose up -d
+docker-compose -p turtlebot-picoros up -d
 ```
 
 The default image is `turtlebox-backend:lyrical`; set `PICOROS_HOST_IMAGE` in a
-`.env` file alongside the compose file if your image has another name. Both
-services reuse that ARM64 image, with no Pi compilation. The router listens on
-UART `/dev/esp32` at **460800 baud**, and TCP 7447. Multicast discovery lets the
+`.env` file alongside the compose file if your image has another name. All
+services reuse that ARM64 image, with no Pi compilation. The central router
+listens on TCP 7447; a separate serial router connects to it and owns UART
+`/dev/esp32` at **250000 baud**. The split isolates serial reception from the
+central router's ROS routing load. Communication was tested on the Pi with a
+10-minute sensor run and repeated router/ESP32 restarts. Reconnection can take
+tens of seconds; motor operation was not tested in that communication check.
+Multicast discovery lets the
 existing Pi Zenoh peers find it. Alternatively, configure peers explicitly
 with `connect/endpoints=["tcp/127.0.0.1:7447"]`. ROS domain remains **1**.
 
@@ -153,15 +158,20 @@ compiler, rclpy, rmw_zenoh_cpp and standard message packages. Default:
 malformed CDR, batched transport frames, real ROS discovery and bidirectional messages, command routing,
 timeout/replay/future/NaN rejection, PID tuning and clock recovery. The same
 transport source runs against the real ROS Zenoh router over both TCP and a
-serial PTY pair, including COBS framing and serial handshakes.
+serial PTY pair, including COBS framing and serial handshakes. A third run uses
+separate TCP and serial routers, matching the deployed topology.
 
 The ESP32 image and flash bundle are cross-built. Host integration uses
 synthetic sensor data and no motor drivers. PTYs do not model physical UART
 timing (the upstream POSIX driver uses 230400 in tests; the ESP32/Pi setting is
-460800). Physical flashing, sensor timing and motor operation on the robot are
-the remaining hardware acceptance checks; they are not implied by host tests.
+250000). Hardware communication tests do not validate motor operation; neither
+physical sensor timing nor motor operation are implied by host tests.
 
-Validated locally: five CTest checks, TCP and serial-PTY integration suites,
+Validated locally: six CTest checks, TCP and serial-PTY integration suites,
 the `esp32` firmware build/flash bundle, and the Compose configuration. The
 firmware uses about 418 kB flash and 28 kB static RAM (runtime heap/stacks are
 additional).
+
+Pi deployment note: the Zenoh router container must receive the serial device
+mapping `/dev/esp32:/dev/esp32`; without it, the router starts but cannot open
+the ESP32 link and the hardware monitor correctly reports stale sensors.

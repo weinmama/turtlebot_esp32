@@ -580,6 +580,11 @@ void setup() {
   // in the watchdog so a lost INIT cannot leave the MCU waiting indefinitely.
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
+  // Prime Arduino's UART0 driver before zenoh-pico creates its own
+  // HardwareSerial(0). On a cold boot the latter can otherwise accept writes
+  // without transmitting them. No text is emitted on the binary Zenoh UART.
+  Serial.begin(250000, SERIAL_8N1, 3, 1);
+  Serial.end();
   if (!transport.begin()) {
     digitalWrite(STBY, LOW);
     delay(1000);

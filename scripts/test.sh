@@ -13,4 +13,5 @@ docker run --rm --network none \
         ctest --test-dir /project/.pio/native --output-on-failure
         python3 /project/test/integration.py
         python3 /project/test/integration.py --serial
+        python3 /project/test/integration.py --serial --split-router
     '
