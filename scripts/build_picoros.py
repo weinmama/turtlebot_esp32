@@ -14,12 +14,16 @@ generated = Path(env.subst("$BUILD_DIR")) / "zenoh-config"
 patched = Path(env.subst("$BUILD_DIR")) / "zenoh-patched"
 subprocess.run([sys.executable, str(root / "scripts/patch_zenoh.py"),
                 str(zenoh / "src/transport/unicast/rx.c"), str(patched / "rx.c")], check=True)
+subprocess.run([sys.executable, str(root / "scripts/patch_arduino_uart.py"),
+                str(zenoh / "src/link/transport/serial/uart_arduino_esp32.cpp"),
+                str(patched / "uart_arduino_esp32.cpp")], check=True)
 patched_picoros = Path(env.subst("$BUILD_DIR")) / "picoros-patched"
 subprocess.run([sys.executable, str(root / "scripts/patch_picoros.py"),
                 str(pico / "src/picoros.c"), str(patched_picoros / "picoros.c")], check=True)
 subprocess.run([
     "cmake", "-S", str(zenoh), "-B", str(generated),
     "-DZP_PLATFORM=arduino_esp32", "-DBUILD_EXAMPLES=OFF", "-DBUILD_TESTING=OFF",
+    "-DZ_FEATURE_UNSTABLE_API=1",
     "-DZ_FEATURE_LINK_SERIAL=1", "-DZ_FEATURE_LINK_TCP=0", "-DZ_FEATURE_LINK_UDP_UNICAST=0",
     "-DZ_FEATURE_LINK_UDP_MULTICAST=0", "-DZ_FEATURE_MULTICAST_TRANSPORT=0",
     "-DZ_FEATURE_SCOUTING=0", "-DZ_FEATURE_AUTO_RECONNECT=0",
@@ -32,6 +36,7 @@ env.BuildSources("$BUILD_DIR/zenoh", str(zenoh / "src"), src_filter=[
     "+<*>", "-<system/>", "+<system/common/>", "+<system/socket/>",
     "+<system/arduino/esp32/>", "-<link/transport/tcp/>", "-<link/transport/udp/>",
     "-<transport/unicast/rx.c>",
+    "-<link/transport/serial/uart_arduino_esp32.cpp>",
 ])
 env.BuildSources("$BUILD_DIR/zenoh-patched-objects", str(patched))
 env.BuildSources("$BUILD_DIR/picoros", str(pico / "src"),

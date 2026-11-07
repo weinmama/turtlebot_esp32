@@ -39,6 +39,7 @@ def main():
     from rclpy.qos import QoSProfile, ReliabilityPolicy
     from geometry_msgs.msg import TwistStamped
     from nav_msgs.msg import Odometry
+    from rcl_interfaces.msg import Log
     from sensor_msgs.msg import Imu
     from std_msgs.msg import String, Float32MultiArray, Int64MultiArray
     from time_sync import ClockResponder
@@ -113,7 +114,8 @@ def main():
             # The router clears serial RX after its accept-loop throttle;
             # TCP listening alone does not mean the serial listener is ready.
             time.sleep(1.1)
-        fixture = subprocess.Popen([str(ROOT / ".pio/native/transport_fixture"), locator],
+        fixture_path = os.environ.get("PICOROS_TEST_FIXTURE", str(ROOT / ".pio/native/transport_fixture"))
+        fixture = subprocess.Popen([fixture_path, locator],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         processes.append(fixture)
         def read_fixture():
@@ -126,10 +128,12 @@ def main():
         node = Node("picoros_integration_test")
         executor = SingleThreadedExecutor()
         executor.add_node(clock); executor.add_node(node)
-        odometry, imu_samples, states = [], [], []
+        odometry, imu_samples, states, ros_logs = [], [], [], []
         node.create_subscription(Odometry, "/wheel/odom", odometry.append, 10)
-        node.create_subscription(Imu, "/imu/data", imu_samples.append, 10)
+        node.create_subscription(Imu, "/imu/data", imu_samples.append,
+                                 QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         node.create_subscription(Float32MultiArray, "/motor/state", states.append, 10)
+        node.create_subscription(Log, "/rosout", lambda message: ros_logs.append(message.msg), 10)
         manual = node.create_publisher(TwistStamped, "/cmd_vel",
                                        QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         navigation = node.create_publisher(TwistStamped, "/hardware/nav_cmd_vel", 1)
@@ -236,6 +240,24 @@ def main():
             executor.add_node(clock)
             spin(1.5)
             command(); wait(lambda: count() == before + 1, "clock recovery failed")
+            if os.environ.get("ROBOT_TRANSPORT_DIAGNOSTICS") == "1":
+                wait(lambda: any(message.startswith("cmd_diag ") for message in ros_logs),
+                     "transport command diagnostics were not published", 3)
+                diagnostic = next(message for message in ros_logs if message.startswith("cmd_diag "))
+                assert "m=" in diagnostic and "n=" in diagnostic and "imu=" in diagnostic
+            else:
+                assert not any(message.startswith("cmd_diag ") for message in ros_logs), \
+                    "disabled diagnostics unexpectedly produced serial traffic"
+            if args.serial:
+                router_log.flush(); router_log.seek(0)
+                serial_router_output = router_log.read()
+                if args.split_router:
+                    edge_log.flush(); edge_log.seek(0)
+                    serial_router_output += edge_log.read()
+                assert "Unable COBS decode" not in serial_router_output, \
+                    f"serial COBS decoder reported an invalid frame:\n{serial_router_output}"
+                assert "Read error on Serial link" not in serial_router_output, \
+                    f"serial router lost its link:\n{serial_router_output}"
             assert router.poll() is None and fixture.poll() is None
             print(f"PASS: {'serial PTY' if args.serial else 'TCP'} ROS discovery, telemetry, command routing, "
                   "replay/age/NaN rejection, timeouts, PID and clock recovery")
@@ -243,6 +265,7 @@ def main():
             router_log.flush(); router_log.seek(0)
             print("Router:", router_log.read(), file=sys.stderr)
             print("Fixture:", fixture.poll(), "\n".join(lines), file=sys.stderr)
+            print("ROS diagnostics:", ros_logs, file=sys.stderr)
             print("Serial:", serial_trace, file=sys.stderr)
             raise
         finally:

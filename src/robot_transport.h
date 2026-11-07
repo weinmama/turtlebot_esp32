@@ -4,7 +4,14 @@
 #include "robot_cdr.h"
 #include "picoros_time_sync.h"
 #include "picoros_command_guard.h"
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
+
+// Transport timing diagnostics generate serial traffic and are for investigation only.
+#ifndef ROBOT_TRANSPORT_DIAGNOSTICS
+#define ROBOT_TRANSPORT_DIAGNOSTICS 0
+#endif
 
 #ifndef ROBOT_ZENOH_LOCATOR
 #define ROBOT_ZENOH_LOCATOR "serial/UART_0#baudrate=250000"
@@ -37,6 +44,14 @@ class RobotTransport {
     int64_t received_ns = 0;
     bool pending = false, valid = false;
   };
+#if ROBOT_TRANSPORT_DIAGNOSTICS
+  struct CommandStats {
+    uint32_t received = 0, invalid = 0, overwritten = 0, unselected = 0;
+    uint32_t accepted = 0, local_stale = 0, replayed = 0;
+    uint32_t rejected[static_cast<size_t>(PicoRosCommandGuard::RejectReason::count)]{};
+    int64_t last_age_ns = 0, max_age_ns = 0;
+  };
+#endif
   static RobotTransport* instance_;
   static void receive_manual(uint8_t*, size_t);
   static void receive_navigation(uint8_t*, size_t);
@@ -53,6 +68,9 @@ class RobotTransport {
   picoros_publisher_t odom_pub_{}, imu_pub_{}, state_pub_{}, log_pub_{}, time_pub_{};
   picoros_subscriber_t manual_sub_{}, nav_sub_{}, mode_sub_{}, tuning_sub_{}, time_sub_{};
   Command commands_[2];
+#if ROBOT_TRANSPORT_DIAGNOSTICS
+  CommandStats command_stats_[2];
+#endif
   PicoRosCommandGuard::Mode mode_ = PicoRosCommandGuard::Mode::blocked;
   int64_t mode_received_ns_ = 0;
   bool mode_pending_ = false;
@@ -62,6 +80,14 @@ class RobotTransport {
   bool tuning_pending_ = false;
   int64_t boot_id_ = 0, request_id_ = 0, request_sent_ns_ = 0;
   int64_t last_sync_ns_ = 0;
+#if ROBOT_TRANSPORT_DIAGNOSTICS
+  int64_t last_diagnostic_report_ns_ = 0;
+  int64_t last_service_start_ns_ = 0;
+  uint32_t service_gap_max_us_ = 0, service_run_max_us_ = 0;
+  // send() is called only by service(); each entry is the longest synchronous
+  // publisher call since the last cmd_diag report: odom, imu, state, log, time.
+  uint32_t publish_max_us_[5] = {};
+#endif
   bool request_pending_ = false, started_ = false;
   ros_Odometry odom_{};
   ros_Imu imu_{};
@@ -69,4 +95,9 @@ class RobotTransport {
   char log_text_[256] = {};
   uint8_t log_level_ = 20;
   bool odom_pending_ = false, imu_pending_ = false, state_pending_ = false, log_pending_ = false;
+#if ROBOT_TRANSPORT_DIAGNOSTICS
+  uint32_t odom_overwritten_ = 0, imu_overwritten_ = 0;
+  uint32_t odom_publish_ok_ = 0, odom_publish_fail_ = 0, odom_stale_ = 0;
+  uint32_t imu_publish_ok_ = 0, imu_publish_fail_ = 0, imu_stale_ = 0;
+#endif
 };

@@ -98,6 +98,22 @@ firmware with the original deploy tool, then re-enable the two old services.
 | `/rosout` | `rcl_interfaces/msg/Log` | low-rate latest log, volatile |
 | `/hardware/time/request`, `/hardware/time/reply` | `std_msgs/msg/Int64MultiArray` | clock exchange, 1 Hz |
 
+Transport diagnostics are **disabled by default** to avoid extra serial traffic
+and formatting work while driving. For investigation, add
+`-DROBOT_TRANSPORT_DIAGNOSTICS=1` to PlatformIO `build_flags` and rebuild; this
+emits a once-per-second `/rosout` `cmd_diag` summary after command or transport
+activity. For each source (`m` manual, `n` navigation), the slash-separated
+counts are received/accepted/invalid/overwritten/unselected/locally-stale/replayed;
+`r` lists guard rejections in this order: clock, sensors, missing heartbeat,
+future heartbeat, stale heartbeat, non-finite command, future command stamp,
+stale command stamp, future receive time, stale delivery, mode mismatch. `a`
+is last/max calculated command age in milliseconds. `odom` and `imu` each show
+publish-call success/failure, stale samples dropped, and mailbox overwrites.
+`svc` shows the maximum interval between TX-service calls and maximum service
+execution time in microseconds. `pub` gives maximum synchronous publisher-call
+duration in microseconds, ordered odom/imu/motor-state/rosout/time-request.
+Publish success means accepted by the Pico-ROS API, not confirmed at the Pi.
+
 The former DDS-side `/odom` becomes `/wheel/odom` directly, matching the old
 bridge output and existing EKF input. `/odom` remains the EKF output. For an
 independent setup, `ROBOT_ODOM_TOPIC` is a compile-time override. Frames remain
@@ -125,6 +141,61 @@ navigation commands require navigation mode. Mode changes invalidate old command
 
 ## Implementation and checks
 
+### Guarded movement probe
+
+Run a single bounded probe from the desktop against the backend container on
+the Pi (the script performs a 10 s passive preflight, streams JSONL diagnostics,
+sends zero commands on completion or abort, then observes the stop for 10 s):
+
+```sh
+ssh pi@robot-pi.local \
+  'docker exec -i turtlebox-hardware-backend /hardware-entrypoint.sh python3 - \
+    --linear-x 0.025 --angular-z -0.25 --duration 2' \
+  < host/robot_validation_probe.py \
+  > /tmp/opencode/robot-validation-left-wheel.jsonl
+```
+
+That example requests only the left wheel in the current differential-drive
+convention. The tool rejects inputs outside ±0.05 m/s, ±0.3 rad/s and 5 s per
+probe. Constant probes remain limited to 5 s. For longer guarded sequences,
+`--profile mixed --duration 30` runs six 5 s phases: straight forward, left and
+right curves, opposite-direction wheel spins, and reverse, each followed by a
+0.25 s zero-command pause. The same profile accepts durations up to 300 s and
+varies its speed scale every 30 s. It aborts on stale sensors/motor feedback, mode changes, foreign command
+echoes, more than three encoder samples over 100 RPM in a rolling second, PWM
+over 255, or 500 ms of requested wheel speed without encoder response. The
+firmware excludes each >100 RPM sample from odometry and PID feedback, holding
+the last valid measured RPM for PID; the requested RPM is never substituted as
+feedback. A fourth outlier in one second brakes both motors and latches motion
+disabled until an operator restarts the MCU. Raw RPM, pulse counts, ISR counts
+and minimum inter-edge intervals remain visible in telemetry/diagnostic logs.
+The encoder ISR rejects edges closer than 1166 µs, derived from the configured
+514.8 pulses/revolution and 100 RPM maximum. Raw, accepted and rejected edges
+are counted separately; rejected edges do not reset the last-accepted-edge
+timer. This threshold cannot suppress a pulse train within the configured RPM
+limit.
+The probe reports whether stillstand was confirmed; missing telemetry is never
+counted as a confirmed stop. Host tests exercise these guards without
+connecting to the robot.
+
+Example invocations (run one at a time and inspect the complete JSONL log
+before proceeding to a longer test):
+
+```sh
+ssh pi@robot-pi.local \
+  'docker exec -i turtlebox-hardware-backend /hardware-entrypoint.sh python3 - \
+    --profile mixed --duration 30' \
+  < host/robot_validation_probe.py \
+  > /tmp/opencode/robot-validation-mixed-30s.jsonl
+
+# Only after reviewing a clean 30 s result:
+ssh pi@robot-pi.local \
+  'docker exec -i turtlebox-hardware-backend /hardware-entrypoint.sh python3 - \
+    --profile mixed --duration 300' \
+  < host/robot_validation_probe.py \
+  > /tmp/opencode/robot-validation-mixed-5min.jsonl
+```
+
 * Pico-ROS and its Zenoh-Pico/Micro-CDR dependencies are pinned submodules.
   `scripts/generate_types.py` derives message layouts and RIHS hashes from
   installed Lyrical type descriptions. Generated types are committed.
@@ -134,6 +205,15 @@ navigation commands require navigation mode. Mode changes invalidate old command
   dedicated regression test verifies the frame boundary.
 * Motor/sensor work stays on the Arduino task. A separate TX task and bounded
   latest-value mailboxes keep serial backpressure away from motor regulation.
+* `scripts/patch_arduino_uart.py` replaces the Arduino UART data path with
+  `include/picoros_uart.h`. Arduino-ESP32 2.0.17 holds the same HAL UART mutex
+  in `uartWriteBuf`, `uartAvailable` and `uartReadBytes`. With synchronous TX,
+  an outgoing telemetry frame therefore blocks incoming commands/heartbeats;
+  the upstream 256-byte RX buffer also cannot absorb a full discovery frame.
+  The adapter retains HardwareSerial initialization/teardown but uses IDF's
+  independent RX/TX synchronization for transfers and a 4096-byte RX buffer.
+  TX remains synchronous without an added queue. Short writes/errors propagate
+  to Zenoh's serial protocol; UART0 remains exclusively binary Zenoh.
 * Commands reject non-finite components, malformed CDR, invalid timestamps,
   timestamps older than 300 ms or more than 200 ms in the future, repeated
   timestamps, and queued delivery older than 200 ms. Heartbeat and command
@@ -167,7 +247,7 @@ timing (the upstream POSIX driver uses 230400 in tests; the ESP32/Pi setting is
 250000). Hardware communication tests do not validate motor operation; neither
 physical sensor timing nor motor operation are implied by host tests.
 
-Validated locally: six CTest checks, TCP and serial-PTY integration suites,
+Validated locally: seven CTest checks, TCP and serial-PTY integration suites,
 the `esp32` firmware build/flash bundle, and the Compose configuration. The
 firmware uses about 418 kB flash and 28 kB static RAM (runtime heap/stacks are
 additional).
@@ -175,3 +255,34 @@ additional).
 Pi deployment note: the Zenoh router container must receive the serial device
 mapping `/dev/esp32:/dev/esp32`; without it, the router starts but cannot open
 the ESP32 link and the hardware monitor correctly reports stale sensors.
+
+### UART contention regression (2026-11-06 UTC)
+
+Before the duplex fix, changing IMU Zenoh transport reliability to Best Effort
+alone did not fix the failure: the 3-cycle forward/reverse test aborted on its
+fourth leg at 302.8 ms odometry age, with TX service up to 148.2 ms, COBS errors,
+and a subsequent telemetry outage. The reliability option controls the Zenoh
+transport; it does not change Pico-ROS's separately advertised ROS graph QoS.
+
+After deploying the UART adapter, two complete runs at 0.05 m/s each finished
+all six legs (target one encoder-derived revolution per wheel per leg):
+
+| Metric | Run 1 | Run 2 |
+|---|---:|---:|
+| Maximum received odometry stamp age | 72.02 ms | 61.27 ms |
+| Maximum received IMU stamp age | 75.58 ms | 67.19 ms |
+| Maximum TX-service duration | 50.652 ms | 49.500 ms |
+| Maximum command age reported by firmware | 26.5 ms | 24.0 ms |
+| Sensor publish failures/stale drops/mailbox overwrites | 0/0/0 | 0/0/0 |
+
+The final motor targets, measured RPM and PWM were zero. Encoder-derived
+travel includes stopping overshoot (about 1.02–1.13 revolutions per wheel in
+these runs); it is not an independent measurement of ground travel. The
+300 ms test feedback limit and firmware watchdogs were not relaxed.
+Synchronous odometry publication still takes about 29–35 ms at 250000 baud;
+the fix lets reception proceed concurrently rather than hiding this wire time.
+
+The new host UART regression test keeps a simulated IDF TX call blocked while
+RX receives fragmented binary data, and checks error/short-write propagation.
+It verifies the adapter contract, not the physical UART. Hardware captures are
+under `/tmp/opencode/uart-duplex-*`, including the two `three-roundtrips` logs.

@@ -11,6 +11,7 @@ docker run --rm --network none \
         cmake -S /project -B /project/.pio/native -DCMAKE_BUILD_TYPE=Debug -DZENOH_LOG=
         cmake --build /project/.pio/native -j4
         ctest --test-dir /project/.pio/native --output-on-failure
+        python3 /project/test/test_robot_validation_probe.py
         python3 /project/test/integration.py
         python3 /project/test/integration.py --serial
         python3 /project/test/integration.py --serial --split-router

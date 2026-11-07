@@ -7,14 +7,24 @@
 
 #include <esp_timer.h>
 #include "esp_task_wdt.h"
+#include <driver/gpio.h>
+#include "freertos/FreeRTOS.h"
 #include <PID_v1.h>
 #include <TB6612_ESP32.h>
 #include "gyro_calibration.h"
+#include "encoder_feedback_guard.h"
+#include "encoder_pulse_filter.h"
 
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
 #define MOTOR_CONTROL_RATE_MS 100  // Milliseconds
 #define IMU_UPDATE_RATE_MS 50      // Milliseconds (20 Hz)
+#define PULSES_PER_MOTOR_REV 11.0f
+#define GEAR_RATIO 46.8f
+static constexpr float PULSES_PER_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO;
+static constexpr float MAX_MOTOR_RPM = 100.0f;
+static constexpr uint32_t MIN_VALID_ENCODER_EDGE_US =
+    static_cast<uint32_t>(60000000.0f / (PULSES_PER_REV * MAX_MOTOR_RPM) + 0.999f);
 
 // High-rate /rosout logging from the motor control loop can stall the serial
 // transport and break timing. Enable only while tuning.
@@ -58,6 +68,29 @@ float motor_state_data[7];
 volatile long ticks_L = 0;
 volatile long ticks_R = 0;
 volatile unsigned long encoder_events = 0;
+volatile unsigned long encoder_events_L = 0;
+volatile unsigned long encoder_events_R = 0;
+volatile unsigned long encoder_raw_edges_L = 0;
+volatile unsigned long encoder_raw_edges_R = 0;
+volatile unsigned long encoder_rejected_edges_L = 0;
+volatile unsigned long encoder_rejected_edges_R = 0;
+static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t encoder_last_edge_us_L = 0;
+volatile uint32_t encoder_last_edge_us_R = 0;
+volatile uint32_t encoder_min_edge_interval_us_L = UINT32_MAX;
+volatile uint32_t encoder_min_edge_interval_us_R = UINT32_MAX;
+static EncoderPulseFilter encoder_pulse_filter_L(MIN_VALID_ENCODER_EDGE_US);
+static EncoderPulseFilter encoder_pulse_filter_R(MIN_VALID_ENCODER_EDGE_US);
+static EncoderFeedbackGuard encoder_feedback_guard;
+static bool encoder_fault_latched = false;
+static float last_valid_left_rpm = 0.0f;
+static float last_valid_right_rpm = 0.0f;
+static bool encoder_interrupts_ready = false;
+static esp_err_t encoder_isr_service_result = ESP_FAIL;
+static esp_err_t encoder_left_intr_type_result = ESP_FAIL;
+static esp_err_t encoder_right_intr_type_result = ESP_FAIL;
+static esp_err_t encoder_left_isr_result = ESP_FAIL;
+static esp_err_t encoder_right_isr_result = ESP_FAIL;
 GyroCalibration gyro_calibration;
 int64_t last_imu_valid_ms = 0, last_odom_valid_ms = 0;
 
@@ -65,9 +98,6 @@ int64_t last_imu_valid_ms = 0, last_odom_valid_ms = 0;
 const float WHEEL_RADIUS = 0.034f;
 const float WHEEL_BASE = 0.20f;
 
-#define PULSES_PER_MOTOR_REV 11.0f
-#define GEAR_RATIO 46.8f
-const float PULSES_PER_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO;
 const float WHEEL_CIRC = 2.0f * PI * WHEEL_RADIUS;
 
 // Maximum angular velocity safety limit
@@ -85,7 +115,6 @@ const int PWM_MAX = 255;
 
 // Motor capability (used for speed saturation). Adjust to match your measured
 // max RPM at PWM_MAX.
-const float MAX_MOTOR_RPM = 100.0f;
 const float MAX_WHEEL_SPEED_MPS = (MAX_MOTOR_RPM / 60.0f) * WHEEL_CIRC;
 
 // Feedforward mapping fitted to unloaded wheel measurements. Recheck under load.
@@ -153,13 +182,45 @@ void log_debug(const char *msg) {
 
 // ===== Encoder ISRs =====
 
-void isrLeft() {
-  ticks_L += ENC_DIR_L * ((digitalRead(ENC_B_L) == HIGH) ? 1 : -1);
-  ++encoder_events;
+void isrLeft(void*) {
+  const int direction = ENC_DIR_L * ((digitalRead(ENC_B_L) == HIGH) ? 1 : -1);
+  const uint32_t edge_us = static_cast<uint32_t>(esp_timer_get_time());
+  portENTER_CRITICAL_ISR(&encoder_mux);
+  ++encoder_raw_edges_L;
+  if (encoder_last_edge_us_L != 0) {
+    const uint32_t interval = edge_us - encoder_last_edge_us_L;
+    if (interval < encoder_min_edge_interval_us_L)
+      encoder_min_edge_interval_us_L = interval;
+  }
+  encoder_last_edge_us_L = edge_us;
+  if (encoder_pulse_filter_L.accept(edge_us)) {
+    ticks_L += direction;
+    ++encoder_events_L;
+    ++encoder_events;
+  } else {
+    ++encoder_rejected_edges_L;
+  }
+  portEXIT_CRITICAL_ISR(&encoder_mux);
 }
-void isrRight() {
-  ticks_R += ENC_DIR_R * ((digitalRead(ENC_B_R) == HIGH) ? 1 : -1);
-  ++encoder_events;
+void isrRight(void*) {
+  const int direction = ENC_DIR_R * ((digitalRead(ENC_B_R) == HIGH) ? 1 : -1);
+  const uint32_t edge_us = static_cast<uint32_t>(esp_timer_get_time());
+  portENTER_CRITICAL_ISR(&encoder_mux);
+  ++encoder_raw_edges_R;
+  if (encoder_last_edge_us_R != 0) {
+    const uint32_t interval = edge_us - encoder_last_edge_us_R;
+    if (interval < encoder_min_edge_interval_us_R)
+      encoder_min_edge_interval_us_R = interval;
+  }
+  encoder_last_edge_us_R = edge_us;
+  if (encoder_pulse_filter_R.accept(edge_us)) {
+    ticks_R += direction;
+    ++encoder_events_R;
+    ++encoder_events;
+  } else {
+    ++encoder_rejected_edges_R;
+  }
+  portEXIT_CRITICAL_ISR(&encoder_mux);
 }
 
 // ===== IMU sampling (20 Hz) =====
@@ -169,9 +230,9 @@ void imu_timer_callback() {
   imu.getEvent(&a, &g, &temp);
 
   static unsigned long previous_encoder_events = 0;
-  noInterrupts();
+  portENTER_CRITICAL(&encoder_mux);
   const unsigned long current_encoder_events = encoder_events;
-  interrupts();
+  portEXIT_CRITICAL(&encoder_mux);
   const float acceleration = sqrtf(a.acceleration.x * a.acceleration.x +
       a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z);
   const bool stationary = current_encoder_events == previous_encoder_events &&
@@ -203,7 +264,9 @@ static int64_t now_ms(void) { return (esp_timer_get_time() / 1000); }
 
 static bool sensors_ready() {
   const int64_t now = now_ms();
-  return gyro_calibration.ready() && last_imu_valid_ms && last_odom_valid_ms &&
+  return encoder_interrupts_ready && gyro_calibration.ready() &&
+         !encoder_fault_latched &&
+         last_imu_valid_ms && last_odom_valid_ms &&
          now - last_imu_valid_ms <= 1000 && now - last_odom_valid_ms <= 1000;
 }
 
@@ -278,12 +341,85 @@ void motor_timer_callback() {
   }
 
   // -------- Encoder --------
-  noInterrupts();
+  portENTER_CRITICAL(&encoder_mux);
   long dL = ticks_L;
   ticks_L = 0;
   long dR = ticks_R;
   ticks_R = 0;
-  interrupts();
+  const unsigned long encoder_events_l = encoder_events_L;
+  const unsigned long encoder_events_r = encoder_events_R;
+  const unsigned long encoder_raw_edges_l = encoder_raw_edges_L;
+  const unsigned long encoder_raw_edges_r = encoder_raw_edges_R;
+  const unsigned long encoder_rejected_edges_l = encoder_rejected_edges_L;
+  const unsigned long encoder_rejected_edges_r = encoder_rejected_edges_R;
+  const uint32_t encoder_min_edge_us_l = encoder_min_edge_interval_us_L;
+  const uint32_t encoder_min_edge_us_r = encoder_min_edge_interval_us_R;
+  encoder_events_L = 0;
+  encoder_events_R = 0;
+  encoder_raw_edges_L = 0;
+  encoder_raw_edges_R = 0;
+  encoder_rejected_edges_L = 0;
+  encoder_rejected_edges_R = 0;
+  encoder_min_edge_interval_us_L = UINT32_MAX;
+  encoder_min_edge_interval_us_R = UINT32_MAX;
+  portEXIT_CRITICAL(&encoder_mux);
+
+  const float raw_left_rpm = (float)dL / PULSES_PER_REV / dt * 60.0f;
+  const float raw_right_rpm = (float)dR / PULSES_PER_REV / dt * 60.0f;
+  const long raw_delta_l = dL;
+  const long raw_delta_r = dR;
+  const EncoderFeedbackGuard::Result encoder_result =
+      encoder_feedback_guard.observe(now_ms(), raw_left_rpm, raw_right_rpm);
+  // Odometry is a two-wheel estimate; suppress the whole interval rather than
+  // inventing a one-wheel-only pose update when either side is quarantined.
+  if (encoder_result.left_invalid || encoder_result.right_invalid) {
+    dL = 0;
+    dR = 0;
+  }
+  if (!encoder_result.left_invalid) {
+    last_valid_left_rpm = raw_left_rpm;
+    left_measured_rpm = fabsf(raw_left_rpm);
+  } else {
+    // Never feed an impossible sample to PID. Hold only the last valid
+    // feedback briefly; do not synthesize feedback from the requested target.
+    left_measured_rpm = fabsf(last_valid_left_rpm);
+  }
+  if (!encoder_result.right_invalid) {
+    last_valid_right_rpm = raw_right_rpm;
+    right_measured_rpm = fabsf(raw_right_rpm);
+  } else {
+    right_measured_rpm = fabsf(last_valid_right_rpm);
+  }
+  if (encoder_result.latched && !encoder_fault_latched) {
+    encoder_fault_latched = true;
+    left_target_rpm_req = right_target_rpm_req = 0.0;
+    left_ramped_rpm = right_ramped_rpm = 0.0;
+    left_cmd = right_cmd = 0.0;
+    motor_left.brake();
+    motor_right.brake();
+    motor_left_pid.SetMode(MANUAL);
+    motor_right_pid.SetMode(MANUAL);
+    log_error("encoder feedback fault latched after repeated >100 RPM samples; motion disabled until MCU restart");
+  }
+  if (encoder_result.left_invalid || encoder_result.right_invalid) {
+    static int64_t last_encoder_fault_log_ms = 0;
+    const int64_t now = now_ms();
+    if (encoder_result.latched || now - last_encoder_fault_log_ms >= 100) {
+    char encoder_log[256];
+    snprintf(encoder_log, sizeof(encoder_log),
+        "encoder_invalid delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f tolerated=%u/3 latch=%d",
+        raw_delta_l, raw_delta_r, encoder_raw_edges_l, encoder_raw_edges_r,
+        encoder_rejected_edges_l, encoder_rejected_edges_r,
+        encoder_events_l, encoder_events_r,
+        encoder_min_edge_us_l == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_l,
+        encoder_min_edge_us_r == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_r,
+          dt * 1000.0f, raw_left_rpm, raw_right_rpm,
+          static_cast<unsigned>(encoder_result.anomalies_in_window),
+          encoder_result.latched ? 1 : 0);
+      transport.log(30, encoder_log);
+      last_encoder_fault_log_ms = now;
+    }
+  }
 
   float dsL = (float)dL / PULSES_PER_REV * WHEEL_CIRC;
   float dsR = (float)dR / PULSES_PER_REV * WHEEL_CIRC;
@@ -338,9 +474,6 @@ void motor_timer_callback() {
   }
 
   // -------- RPM --------
-  left_measured_rpm = fabs((dsL / WHEEL_CIRC) / dt * 60.0f);
-  right_measured_rpm = fabs((dsR / WHEEL_CIRC) / dt * 60.0f);
-
   // Decide whether to stop based on commanded targets (not measured odometry).
   // Using odometry here can keep the robot braked forever at standstill.
   const bool cmd_timed_out =
@@ -349,6 +482,7 @@ void motor_timer_callback() {
   const bool targets_zero = ((fabs(left_target_rpm_req) < TARGET_RPM_EPS) &&
                              (fabs(right_target_rpm_req) < TARGET_RPM_EPS));
   const bool robot_stopped = cmd_timed_out || targets_zero || dt > 0.5f ||
+                             encoder_fault_latched ||
                              transport.should_stop(sensors_ready());
 
   // Slew-limit the actual PID setpoints towards the requested targets.
@@ -469,11 +603,64 @@ void motor_timer_callback() {
   // applied PWM per wheel, and actual control interval in seconds.
   motor_state_data[0] = left_ramped_rpm;
   motor_state_data[1] = right_ramped_rpm;
-  motor_state_data[2] = (float)dL / PULSES_PER_REV / dt * 60.0f;
-  motor_state_data[3] = (float)dR / PULSES_PER_REV / dt * 60.0f;
+  // Keep raw measurements visible to diagnostics/host guards. Invalid raw
+  // samples above were excluded from odometry and PID input.
+  motor_state_data[2] = raw_left_rpm;
+  motor_state_data[3] = raw_right_rpm;
   motor_state_data[4] = pwm_l;
   motor_state_data[5] = pwm_r;
   motor_state_data[6] = dt;
+#if ROBOT_TRANSPORT_DIAGNOSTICS
+  // Encoder outliers and commanded motion without ticks are otherwise hard
+  // to distinguish from transport failures using the compact motor topic.
+  // Include ISR event counts and rate-limit to avoid adding serial load.
+  static int64_t last_encoder_outlier_diagnostic_ms = 0;
+  static int64_t last_encoder_missing_diagnostic_ms = 0;
+  const int64_t diagnostic_now_ms = now_ms();
+  const bool encoder_outlier = fabsf(motor_state_data[2]) > MAX_MOTOR_RPM ||
+                               fabsf(motor_state_data[3]) > MAX_MOTOR_RPM;
+  const bool left_feedback_missing = fabs(left_ramped_rpm) >= 5.0 && dL == 0;
+  const bool right_feedback_missing = fabs(right_ramped_rpm) >= 5.0 && dR == 0;
+  static int64_t last_encoder_trace_ms = 0;
+  if ((fabs(left_ramped_rpm) >= 5.0 || fabs(right_ramped_rpm) >= 5.0) &&
+      diagnostic_now_ms - last_encoder_trace_ms >= 1000) {
+    char encoder_log[256];
+    snprintf(encoder_log, sizeof(encoder_log),
+        "encoder_trace delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
+        raw_delta_l, raw_delta_r, encoder_raw_edges_l, encoder_raw_edges_r,
+        encoder_rejected_edges_l, encoder_rejected_edges_r,
+        encoder_events_l, encoder_events_r,
+        encoder_min_edge_us_l == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_l,
+        encoder_min_edge_us_r == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_r,
+        dt * 1000.0f, raw_left_rpm, raw_right_rpm,
+        left_ramped_rpm, right_ramped_rpm, pwm_l, pwm_r);
+    transport.log(20, encoder_log);
+    last_encoder_trace_ms = diagnostic_now_ms;
+  }
+  if (encoder_outlier &&
+      diagnostic_now_ms - last_encoder_outlier_diagnostic_ms >= 1000) {
+    char encoder_log[192];
+    snprintf(encoder_log, sizeof(encoder_log),
+        "encoder_diag delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
+        dL, dR, encoder_raw_edges_l, encoder_raw_edges_r,
+        encoder_rejected_edges_l, encoder_rejected_edges_r,
+        encoder_events_l, encoder_events_r, dt * 1000.0f,
+        motor_state_data[2], motor_state_data[3],
+        left_ramped_rpm, right_ramped_rpm, pwm_l, pwm_r);
+    transport.log(30, encoder_log);
+    last_encoder_outlier_diagnostic_ms = diagnostic_now_ms;
+  }
+  if (!encoder_outlier && (left_feedback_missing || right_feedback_missing) &&
+      diagnostic_now_ms - last_encoder_missing_diagnostic_ms >= 1000) {
+    char encoder_log[192];
+    snprintf(encoder_log, sizeof(encoder_log),
+        "encoder_no_feedback delta=%ld,%ld isr=%lu,%lu dt_ms=%.1f target=%.1f,%.1f pwm=%d,%d",
+        dL, dR, encoder_events_l, encoder_events_r, dt * 1000.0f,
+        left_ramped_rpm, right_ramped_rpm, pwm_l, pwm_r);
+    transport.log(30, encoder_log);
+    last_encoder_missing_diagnostic_ms = diagnostic_now_ms;
+  }
+#endif
   transport.publish(motor_state_msg);
 }
 
@@ -539,8 +726,30 @@ void setup() {
   pinMode(ENC_A_R, INPUT_PULLUP);
   pinMode(ENC_B_R, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(ENC_A_L), isrLeft, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENC_A_R), isrRight, RISING);
+  // Do not rely on Arduino attachInterrupt(), which discards the result of
+  // gpio_isr_handler_add(). A silently rejected left registration would look
+  // exactly like persistent zero wheel speed and let the PID wind up.
+  encoder_isr_service_result = gpio_install_isr_service(0);
+  const bool isr_service_available = encoder_isr_service_result == ESP_OK ||
+                                     encoder_isr_service_result == ESP_ERR_INVALID_STATE;
+  if (isr_service_available) {
+    encoder_left_intr_type_result = gpio_set_intr_type(
+        static_cast<gpio_num_t>(ENC_A_L), GPIO_INTR_POSEDGE);
+    encoder_right_intr_type_result = gpio_set_intr_type(
+        static_cast<gpio_num_t>(ENC_A_R), GPIO_INTR_POSEDGE);
+    if (encoder_left_intr_type_result == ESP_OK) {
+      encoder_left_isr_result = gpio_isr_handler_add(
+          static_cast<gpio_num_t>(ENC_A_L), isrLeft, nullptr);
+    }
+    if (encoder_right_intr_type_result == ESP_OK) {
+      encoder_right_isr_result = gpio_isr_handler_add(
+          static_cast<gpio_num_t>(ENC_A_R), isrRight, nullptr);
+    }
+  }
+  encoder_interrupts_ready = isr_service_available &&
+      encoder_left_intr_type_result == ESP_OK &&
+      encoder_right_intr_type_result == ESP_OK &&
+      encoder_left_isr_result == ESP_OK && encoder_right_isr_result == ESP_OK;
 
   // PID outputs are used as a signed correction term around a feedforward PWM.
   motor_left_pid.SetOutputLimits(-PWM_MAX, PWM_MAX);
@@ -590,6 +799,22 @@ void setup() {
     delay(1000);
     esp_restart();
   }
+  if (!encoder_interrupts_ready) {
+    char encoder_error[192];
+    snprintf(encoder_error, sizeof(encoder_error),
+        "encoder ISR setup failed service=%d edge=%d,%d handler=%d,%d; motion disabled",
+        static_cast<int>(encoder_isr_service_result),
+        static_cast<int>(encoder_left_intr_type_result),
+        static_cast<int>(encoder_right_intr_type_result),
+        static_cast<int>(encoder_left_isr_result),
+        static_cast<int>(encoder_right_isr_result));
+    log_error(encoder_error);
+  }
+  char encoder_filter_log[112];
+  snprintf(encoder_filter_log, sizeof(encoder_filter_log),
+      "encoder pulse filter min_interval_us=%lu max_rpm=%.1f",
+      (unsigned long)MIN_VALID_ENCODER_EDGE_US, MAX_MOTOR_RPM);
+  log_info(encoder_filter_log);
   // A separate communication task prevents a congested serial connection from
   // delaying motor regulation or its 500 ms command watchdog.
   if (xTaskCreate([](void*) {

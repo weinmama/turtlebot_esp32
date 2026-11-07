@@ -7,12 +7,36 @@ int main() {
   Guard g;
   assert(g.should_stop(0, true, true));
   assert(!g.accept(Guard::Source::manual, 0.1f, 0.0f, 0, 0, true, true));
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 0, true, true) ==
+         Guard::RejectReason::heartbeat_missing);
   g.heartbeat(Guard::Mode::mapping, 100);
+  assert(g.rejection_reason(Guard::Source::navigation, 0.1f, 0.0f, 0, 100, true, true) ==
+         Guard::RejectReason::mode_mismatch);
   assert(!g.accept(Guard::Source::navigation, 0.1f, 0.0f, 0, 100, true, true));
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 100, true, false) ==
+         Guard::RejectReason::sensors_not_ready);
   assert(!g.accept(Guard::Source::manual, std::numeric_limits<float>::quiet_NaN(), 0.0f, 0, 100, true, true));
+  assert(g.rejection_reason(Guard::Source::manual, std::numeric_limits<float>::quiet_NaN(), 0.0f,
+                            0, 100, true, true) == Guard::RejectReason::nonfinite_command);
   assert(!g.accept(Guard::Source::manual, 0.1f, 0.0f, Guard::kMaxCommandAgeNs + 1, 100, true, true));
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, Guard::kMaxCommandAgeNs + 1,
+                            100, true, true) == Guard::RejectReason::command_stale);
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, -Guard::kFutureToleranceNs - 1,
+                            100, true, true) == Guard::RejectReason::command_from_future);
   assert(!g.accept(Guard::Source::manual, 0.1f, 0.0f, 0, 100, false, true));
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 100, false, true) ==
+         Guard::RejectReason::clock_invalid);
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 100, true, true, 101) ==
+         Guard::RejectReason::receive_from_future);
+  g.heartbeat(Guard::Mode::mapping, 300);
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 301, true, true, 100) ==
+         Guard::RejectReason::delivery_stale);
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 299, true, true) ==
+         Guard::RejectReason::heartbeat_from_future);
+  g.heartbeat(Guard::Mode::mapping, 100);
   assert(g.accept(Guard::Source::manual, 0.1f, 0.0f, 0, 100, true, true));
+  assert(g.rejection_reason(Guard::Source::manual, 0.1f, 0.0f, 0, 601, true, true) ==
+         Guard::RejectReason::heartbeat_stale);
   assert(!g.should_stop(600, true, true));
   assert(g.should_stop(601, true, true));
   assert(g.should_stop(101, false, true));
