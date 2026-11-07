@@ -8,12 +8,14 @@
 #include <esp_timer.h>
 #include "esp_task_wdt.h"
 #include <driver/gpio.h>
+#include <driver/pcnt.h>
 #include "freertos/FreeRTOS.h"
 #include <PID_v1.h>
 #include <TB6612_ESP32.h>
 #include "gyro_calibration.h"
 #include "encoder_feedback_guard.h"
 #include "encoder_pulse_filter.h"
+#include "encoder_speed_estimator.h"
 
 // ---------------- Definitions ----------------
 #define WDT_TIMEOUT 2              // Secsonds
@@ -22,9 +24,10 @@
 #define PULSES_PER_MOTOR_REV 11.0f
 #define GEAR_RATIO 46.8f
 static constexpr float PULSES_PER_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO;
-static constexpr float MAX_MOTOR_RPM = 100.0f;
+static constexpr float MAX_MOTOR_RPM = 130.0f;
+static constexpr float ENCODER_GUARD_RPM = 140.0f;
 static constexpr uint32_t MIN_VALID_ENCODER_EDGE_US =
-    static_cast<uint32_t>(60000000.0f / (PULSES_PER_REV * MAX_MOTOR_RPM) + 0.999f);
+    static_cast<uint32_t>(60000000.0f / (PULSES_PER_REV * ENCODER_GUARD_RPM) + 0.999f);
 
 // High-rate /rosout logging from the motor control loop can stall the serial
 // transport and break timing. Enable only while tuning.
@@ -81,8 +84,20 @@ volatile uint32_t encoder_min_edge_interval_us_L = UINT32_MAX;
 volatile uint32_t encoder_min_edge_interval_us_R = UINT32_MAX;
 static EncoderPulseFilter encoder_pulse_filter_L(MIN_VALID_ENCODER_EDGE_US);
 static EncoderPulseFilter encoder_pulse_filter_R(MIN_VALID_ENCODER_EDGE_US);
+static EncoderSpeedEstimator encoder_speed_estimator_L;
+static EncoderSpeedEstimator encoder_speed_estimator_R;
+static int16_t pcnt_previous_L = 0;
+static int16_t pcnt_previous_R = 0;
+static bool pcnt_previous_valid_L = false;
+static bool pcnt_previous_valid_R = false;
+static int encoder_direction_L = 0;
+static int encoder_direction_R = 0;
+static bool pcnt_encoder_ready = false;
+static esp_err_t pcnt_left_setup_result = ESP_FAIL;
+static esp_err_t pcnt_right_setup_result = ESP_FAIL;
 static EncoderFeedbackGuard encoder_feedback_guard;
 static bool encoder_fault_latched = false;
+static const char *encoder_fault_reason = nullptr;
 static float last_valid_left_rpm = 0.0f;
 static float last_valid_right_rpm = 0.0f;
 static bool encoder_interrupts_ready = false;
@@ -193,6 +208,7 @@ void isrLeft(void*) {
       encoder_min_edge_interval_us_L = interval;
   }
   encoder_last_edge_us_L = edge_us;
+  encoder_speed_estimator_L.record(edge_us);
   if (encoder_pulse_filter_L.accept(edge_us)) {
     ticks_L += direction;
     ++encoder_events_L;
@@ -213,6 +229,7 @@ void isrRight(void*) {
       encoder_min_edge_interval_us_R = interval;
   }
   encoder_last_edge_us_R = edge_us;
+  encoder_speed_estimator_R.record(edge_us);
   if (encoder_pulse_filter_R.accept(edge_us)) {
     ticks_R += direction;
     ++encoder_events_R;
@@ -268,6 +285,56 @@ static bool sensors_ready() {
          !encoder_fault_latched &&
          last_imu_valid_ms && last_odom_valid_ms &&
          now - last_imu_valid_ms <= 1000 && now - last_odom_valid_ms <= 1000;
+}
+
+static esp_err_t configure_pcnt_encoder(pcnt_unit_t unit, int pulse_pin,
+                                        int direction_pin, int direction_sign) {
+  pcnt_config_t config{};
+  config.pulse_gpio_num = pulse_pin;
+  config.ctrl_gpio_num = direction_pin;
+  // Match the legacy ISR convention: B high on A rising is positive.
+  config.lctrl_mode = direction_sign > 0 ? PCNT_MODE_REVERSE : PCNT_MODE_KEEP;
+  config.hctrl_mode = direction_sign > 0 ? PCNT_MODE_KEEP : PCNT_MODE_REVERSE;
+  config.pos_mode = PCNT_COUNT_INC;
+  config.neg_mode = PCNT_COUNT_DIS;
+  config.counter_h_lim = 30000;
+  config.counter_l_lim = -30000;
+  config.unit = unit;
+  config.channel = PCNT_CHANNEL_0;
+
+  esp_err_t result = pcnt_unit_config(&config);
+  if (result != ESP_OK) return result;
+  result = pcnt_set_filter_value(unit, 1023);
+  if (result != ESP_OK) return result;
+  result = pcnt_filter_enable(unit);
+  if (result != ESP_OK) return result;
+  result = pcnt_counter_pause(unit);
+  if (result != ESP_OK) return result;
+  result = pcnt_counter_clear(unit);
+  if (result != ESP_OK) return result;
+  return pcnt_counter_resume(unit);
+}
+
+static esp_err_t read_pcnt_delta(pcnt_unit_t unit, int16_t& previous,
+                                 bool& previous_valid, int16_t& delta) {
+  int16_t current = 0;
+  esp_err_t result = pcnt_get_counter_value(unit, &current);
+  if (result != ESP_OK) return result;
+  // PCNT is cleared during setup, so the first read must include all edges
+  // observed since boot rather than dropping that initial interval.
+  delta = previous_valid ? static_cast<int16_t>(current - previous) : current;
+  previous = current;
+  previous_valid = true;
+
+  // Keep ample distance from the configured hardware limits during long runs.
+  // Clearing does not pause the PCNT unit; only a vanishingly small race at
+  // this maintenance point can lose an edge, rather than every control tick.
+  if (current >= 20000 || current <= -20000) {
+    result = pcnt_counter_clear(unit);
+    if (result != ESP_OK) return result;
+    previous = 0;
+  }
+  return ESP_OK;
 }
 
 static float normalize_angle(float a) {
@@ -342,9 +409,16 @@ void motor_timer_callback() {
 
   // -------- Encoder --------
   portENTER_CRITICAL(&encoder_mux);
-  long dL = ticks_L;
+  const uint32_t encoder_now_us = static_cast<uint32_t>(esp_timer_get_time());
+  bool left_period_ready = encoder_speed_estimator_L.ready(encoder_now_us);
+  bool right_period_ready = encoder_speed_estimator_R.ready(encoder_now_us);
+  const float estimated_left_magnitude_rpm = encoder_speed_estimator_L.rpm(
+      encoder_now_us, PULSES_PER_REV);
+  const float estimated_right_magnitude_rpm = encoder_speed_estimator_R.rpm(
+      encoder_now_us, PULSES_PER_REV);
+  const long gpio_delta_l = ticks_L;
   ticks_L = 0;
-  long dR = ticks_R;
+  const long gpio_delta_r = ticks_R;
   ticks_R = 0;
   const unsigned long encoder_events_l = encoder_events_L;
   const unsigned long encoder_events_r = encoder_events_R;
@@ -364,10 +438,62 @@ void motor_timer_callback() {
   encoder_min_edge_interval_us_R = UINT32_MAX;
   portEXIT_CRITICAL(&encoder_mux);
 
-  const float raw_left_rpm = (float)dL / PULSES_PER_REV / dt * 60.0f;
-  const float raw_right_rpm = (float)dR / PULSES_PER_REV / dt * 60.0f;
-  const long raw_delta_l = dL;
-  const long raw_delta_r = dR;
+  int16_t pcnt_delta_l = 0;
+  int16_t pcnt_delta_r = 0;
+  const esp_err_t pcnt_read_l = read_pcnt_delta(
+      PCNT_UNIT_0, pcnt_previous_L, pcnt_previous_valid_L, pcnt_delta_l);
+  const esp_err_t pcnt_read_r = read_pcnt_delta(
+      PCNT_UNIT_1, pcnt_previous_R, pcnt_previous_valid_R, pcnt_delta_r);
+  const bool pcnt_read_ok = pcnt_read_l == ESP_OK && pcnt_read_r == ESP_OK;
+  if (!pcnt_read_ok && !encoder_fault_latched) {
+    encoder_fault_latched = true;
+    encoder_fault_reason = "fault:pcnt_read";
+    left_target_rpm_req = right_target_rpm_req = 0.0;
+    left_ramped_rpm = right_ramped_rpm = 0.0;
+    left_cmd = right_cmd = 0.0;
+    motor_left.brake();
+    motor_right.brake();
+    motor_left_pid.SetMode(MANUAL);
+    motor_right_pid.SetMode(MANUAL);
+    char pcnt_error[112];
+    snprintf(pcnt_error, sizeof(pcnt_error),
+        "PCNT read failed left=%d right=%d; motion latched off until MCU restart",
+        static_cast<int>(pcnt_read_l), static_cast<int>(pcnt_read_r));
+    log_error(pcnt_error);
+  }
+  // PCNT supplies signed hardware-decoded counts for pose integration and
+  // direction. Median GPIO edge periods supply an uncapped speed magnitude;
+  // PCNT count rate is a startup fallback until enough periods are observed.
+  long dL = pcnt_delta_l;
+  long dR = pcnt_delta_r;
+  const int new_direction_l = pcnt_delta_l > 0 ? 1 : (pcnt_delta_l < 0 ? -1 : 0);
+  const int new_direction_r = pcnt_delta_r > 0 ? 1 : (pcnt_delta_r < 0 ? -1 : 0);
+  if (new_direction_l != 0 && encoder_direction_L != 0 &&
+      new_direction_l != encoder_direction_L) {
+    portENTER_CRITICAL(&encoder_mux);
+    encoder_speed_estimator_L.reset();
+    portEXIT_CRITICAL(&encoder_mux);
+    left_period_ready = false;
+  }
+  if (new_direction_r != 0 && encoder_direction_R != 0 &&
+      new_direction_r != encoder_direction_R) {
+    portENTER_CRITICAL(&encoder_mux);
+    encoder_speed_estimator_R.reset();
+    portEXIT_CRITICAL(&encoder_mux);
+    right_period_ready = false;
+  }
+  if (new_direction_l != 0) encoder_direction_L = new_direction_l;
+  if (new_direction_r != 0) encoder_direction_R = new_direction_r;
+  const float count_left_rpm = (float)pcnt_delta_l / PULSES_PER_REV / dt * 60.0f;
+  const float count_right_rpm = (float)pcnt_delta_r / PULSES_PER_REV / dt * 60.0f;
+  const float left_magnitude_rpm = left_period_ready
+      ? estimated_left_magnitude_rpm : fabsf(count_left_rpm);
+  const float right_magnitude_rpm = right_period_ready
+      ? estimated_right_magnitude_rpm : fabsf(count_right_rpm);
+  const float raw_left_rpm = encoder_direction_L == 0 ? 0.0f
+      : encoder_direction_L * left_magnitude_rpm;
+  const float raw_right_rpm = encoder_direction_R == 0 ? 0.0f
+      : encoder_direction_R * right_magnitude_rpm;
   const EncoderFeedbackGuard::Result encoder_result =
       encoder_feedback_guard.observe(now_ms(), raw_left_rpm, raw_right_rpm);
   // Odometry is a two-wheel estimate; suppress the whole interval rather than
@@ -392,6 +518,7 @@ void motor_timer_callback() {
   }
   if (encoder_result.latched && !encoder_fault_latched) {
     encoder_fault_latched = true;
+    encoder_fault_reason = "fault:encoder_overspeed";
     left_target_rpm_req = right_target_rpm_req = 0.0;
     left_ramped_rpm = right_ramped_rpm = 0.0;
     left_cmd = right_cmd = 0.0;
@@ -399,16 +526,20 @@ void motor_timer_callback() {
     motor_right.brake();
     motor_left_pid.SetMode(MANUAL);
     motor_right_pid.SetMode(MANUAL);
-    log_error("encoder feedback fault latched after repeated >100 RPM samples; motion disabled until MCU restart");
+    log_error("encoder feedback fault latched after repeated >140 RPM samples; motion disabled until MCU restart");
   }
+  const char *status = encoder_fault_reason ? encoder_fault_reason
+      : (encoder_interrupts_ready ? "ready" : "fault:capture_setup");
+  transport.publish_encoder_status(status);
   if (encoder_result.left_invalid || encoder_result.right_invalid) {
     static int64_t last_encoder_fault_log_ms = 0;
     const int64_t now = now_ms();
     if (encoder_result.latched || now - last_encoder_fault_log_ms >= 100) {
     char encoder_log[256];
     snprintf(encoder_log, sizeof(encoder_log),
-        "encoder_invalid delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f tolerated=%u/3 latch=%d",
-        raw_delta_l, raw_delta_r, encoder_raw_edges_l, encoder_raw_edges_r,
+        "encoder_invalid pcnt=%ld,%ld gpio=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f tolerated=%u/3 latch=%d",
+        pcnt_delta_l, pcnt_delta_r, gpio_delta_l, gpio_delta_r,
+        encoder_raw_edges_l, encoder_raw_edges_r,
         encoder_rejected_edges_l, encoder_rejected_edges_r,
         encoder_events_l, encoder_events_r,
         encoder_min_edge_us_l == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_l,
@@ -617,8 +748,8 @@ void motor_timer_callback() {
   static int64_t last_encoder_outlier_diagnostic_ms = 0;
   static int64_t last_encoder_missing_diagnostic_ms = 0;
   const int64_t diagnostic_now_ms = now_ms();
-  const bool encoder_outlier = fabsf(motor_state_data[2]) > MAX_MOTOR_RPM ||
-                               fabsf(motor_state_data[3]) > MAX_MOTOR_RPM;
+  const bool encoder_outlier = fabsf(motor_state_data[2]) > ENCODER_GUARD_RPM ||
+                               fabsf(motor_state_data[3]) > ENCODER_GUARD_RPM;
   const bool left_feedback_missing = fabs(left_ramped_rpm) >= 5.0 && dL == 0;
   const bool right_feedback_missing = fabs(right_ramped_rpm) >= 5.0 && dR == 0;
   static int64_t last_encoder_trace_ms = 0;
@@ -626,8 +757,9 @@ void motor_timer_callback() {
       diagnostic_now_ms - last_encoder_trace_ms >= 1000) {
     char encoder_log[256];
     snprintf(encoder_log, sizeof(encoder_log),
-        "encoder_trace delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
-        raw_delta_l, raw_delta_r, encoder_raw_edges_l, encoder_raw_edges_r,
+        "encoder_trace pcnt=%ld,%ld gpio=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu edge_min_us=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
+        pcnt_delta_l, pcnt_delta_r, gpio_delta_l, gpio_delta_r,
+        encoder_raw_edges_l, encoder_raw_edges_r,
         encoder_rejected_edges_l, encoder_rejected_edges_r,
         encoder_events_l, encoder_events_r,
         encoder_min_edge_us_l == UINT32_MAX ? 0UL : (unsigned long)encoder_min_edge_us_l,
@@ -641,8 +773,9 @@ void motor_timer_callback() {
       diagnostic_now_ms - last_encoder_outlier_diagnostic_ms >= 1000) {
     char encoder_log[192];
     snprintf(encoder_log, sizeof(encoder_log),
-        "encoder_diag delta=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
-        dL, dR, encoder_raw_edges_l, encoder_raw_edges_r,
+        "encoder_diag pcnt=%ld,%ld gpio=%ld,%ld raw=%lu,%lu reject=%lu,%lu accepted=%lu,%lu dt_ms=%.1f rpm=%.1f,%.1f target=%.1f,%.1f pwm=%d,%d",
+        pcnt_delta_l, pcnt_delta_r, gpio_delta_l, gpio_delta_r,
+        encoder_raw_edges_l, encoder_raw_edges_r,
         encoder_rejected_edges_l, encoder_rejected_edges_r,
         encoder_events_l, encoder_events_r, dt * 1000.0f,
         motor_state_data[2], motor_state_data[3],
@@ -691,8 +824,8 @@ void cmd_vel_callback(const ros_TwistStamped *msg) {
       (vL >= 0.0f) ? 1.0f : -1.0f; // Update direction coefficient
   right_direction_coeff = (vR >= 0.0f) ? 1.0f : -1.0f;
 
-  left_target_rpm_req = fabs(vL / WHEEL_CIRC * 60.0f);
-  right_target_rpm_req = fabs(vR / WHEEL_CIRC * 60.0f);
+  left_target_rpm_req = fminf(MAX_MOTOR_RPM, fabsf(vL / WHEEL_CIRC * 60.0f));
+  right_target_rpm_req = fminf(MAX_MOTOR_RPM, fabsf(vR / WHEEL_CIRC * 60.0f));
 
   last_cmd_vel_ms = now_ms();
 
@@ -726,6 +859,15 @@ void setup() {
   pinMode(ENC_A_R, INPUT_PULLUP);
   pinMode(ENC_B_R, INPUT_PULLUP);
 
+  // PCNT captures A-edge counts and samples B in hardware for direction;
+  // GPIO remains a filtered comparison/edge-period diagnostic channel.
+  pcnt_left_setup_result = configure_pcnt_encoder(
+      PCNT_UNIT_0, ENC_A_L, ENC_B_L, ENC_DIR_L);
+  pcnt_right_setup_result = configure_pcnt_encoder(
+      PCNT_UNIT_1, ENC_A_R, ENC_B_R, ENC_DIR_R);
+  pcnt_encoder_ready = pcnt_left_setup_result == ESP_OK &&
+                       pcnt_right_setup_result == ESP_OK;
+
   // Do not rely on Arduino attachInterrupt(), which discards the result of
   // gpio_isr_handler_add(). A silently rejected left registration would look
   // exactly like persistent zero wheel speed and let the PID wind up.
@@ -747,6 +889,7 @@ void setup() {
     }
   }
   encoder_interrupts_ready = isr_service_available &&
+      pcnt_encoder_ready &&
       encoder_left_intr_type_result == ESP_OK &&
       encoder_right_intr_type_result == ESP_OK &&
       encoder_left_isr_result == ESP_OK && encoder_right_isr_result == ESP_OK;
@@ -800,9 +943,11 @@ void setup() {
     esp_restart();
   }
   if (!encoder_interrupts_ready) {
-    char encoder_error[192];
+    char encoder_error[224];
     snprintf(encoder_error, sizeof(encoder_error),
-        "encoder ISR setup failed service=%d edge=%d,%d handler=%d,%d; motion disabled",
+        "encoder capture setup failed pcnt=%d,%d service=%d edge=%d,%d handler=%d,%d; motion disabled",
+        static_cast<int>(pcnt_left_setup_result),
+        static_cast<int>(pcnt_right_setup_result),
         static_cast<int>(encoder_isr_service_result),
         static_cast<int>(encoder_left_intr_type_result),
         static_cast<int>(encoder_right_intr_type_result),
@@ -810,10 +955,12 @@ void setup() {
         static_cast<int>(encoder_right_isr_result));
     log_error(encoder_error);
   }
-  char encoder_filter_log[112];
+  char encoder_filter_log[128];
   snprintf(encoder_filter_log, sizeof(encoder_filter_log),
-      "encoder pulse filter min_interval_us=%lu max_rpm=%.1f",
-      (unsigned long)MIN_VALID_ENCODER_EDGE_US, MAX_MOTOR_RPM);
+      "encoder capture=pcnt0,pcnt1 hw_glitch_filter_cycles=1023 gpio_compare_min_interval_us=%lu speed_glitch_min_us=%lu max_rpm=%.1f",
+      (unsigned long)MIN_VALID_ENCODER_EDGE_US,
+      (unsigned long)EncoderSpeedEstimator::kMinimumElectricalSpacingUs,
+      MAX_MOTOR_RPM);
   log_info(encoder_filter_log);
   // A separate communication task prevents a congested serial connection from
   // delaying motor regulation or its 500 ms command watchdog.

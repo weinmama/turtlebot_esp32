@@ -10,7 +10,7 @@
 // both wheels are invalid.
 class EncoderFeedbackGuard {
  public:
-  static constexpr float kMaxRpm = 100.0f;
+  static constexpr float kMaxRpm = 140.0f;
   static constexpr int64_t kWindowMs = 1000;
   static constexpr size_t kToleratedSamples = 3;
 

@@ -43,6 +43,7 @@ bool RobotTransport::begin(const char* locator) {
   // the ROS graph QoS advertised by Pico-ROS's liveliness declaration.
   PUB(imu_pub_, "imu/data", ros_Imu, Z_RELIABILITY_BEST_EFFORT);
   PUB(state_pub_, "motor/state", ros_Float32MultiArray, Z_RELIABILITY_RELIABLE);
+  PUB(encoder_status_pub_, "hardware/encoder/status", ros_String, Z_RELIABILITY_RELIABLE);
   PUB(log_pub_, "rosout", ros_Log, Z_RELIABILITY_RELIABLE);
   PUB(time_pub_, "hardware/time/request", ros_Int64MultiArray, Z_RELIABILITY_RELIABLE);
   SUB(manual_sub_, "cmd_vel", ros_TwistStamped, receive_manual);
@@ -256,6 +257,11 @@ void RobotTransport::publish(const ros_Float32MultiArray& message) {
   std::lock_guard<std::mutex> lock(mutex_);
   memcpy(state_, message.data.data, sizeof(state_)); state_pending_ = true;
 }
+void RobotTransport::publish_encoder_status(const char* status) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  snprintf(encoder_status_, sizeof(encoder_status_), "%s", status ? status : "unknown");
+  encoder_status_pending_ = true;
+}
 void RobotTransport::log(uint8_t level, const char* message) {
   std::lock_guard<std::mutex> lock(mutex_);
   snprintf(log_text_, sizeof(log_text_), "%s", message);
@@ -317,9 +323,10 @@ void RobotTransport::service() {
   ros_Odometry odom;
   ros_Imu imu;
   float state[7];
+  char encoder_status[sizeof(encoder_status_)];
   char text[256];
   uint8_t level;
-  bool have_odom, have_imu, have_state, have_log;
+  bool have_odom, have_imu, have_state, have_encoder_status, have_log;
   {
     std::lock_guard<std::mutex> lock(mutex_);
 #if ROBOT_TRANSPORT_DIAGNOSTICS
@@ -398,8 +405,11 @@ void RobotTransport::service() {
     if (have_odom) odom = odom_;
     if (have_imu) imu = imu_;
     if (have_state) memcpy(state, state_, sizeof(state));
+    have_encoder_status = encoder_status_pending_;
+    if (have_encoder_status) memcpy(encoder_status, encoder_status_, sizeof(encoder_status));
     if (have_log) { memcpy(text, log_text_, sizeof(text)); level = log_level_; }
-    odom_pending_ = imu_pending_ = state_pending_ = log_pending_ = false;
+    odom_pending_ = imu_pending_ = state_pending_ = false;
+    encoder_status_pending_ = log_pending_ = false;
   }
   int64_t stamp;
   if (epoch(stamp)) {
@@ -441,6 +451,12 @@ void RobotTransport::service() {
       message.level = level; message.name = const_cast<char*>("turtlebot_lowlevel_node");
       message.msg = text; message.file = message.function = const_cast<char*>("");
       send(log_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Log));
+    }
+    if (have_encoder_status) {
+      ros_String message{};
+      message.data = encoder_status;
+      send(encoder_status_pub_, bytes,
+           robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_String));
     }
   }
   if (have_state) {

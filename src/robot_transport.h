@@ -35,6 +35,7 @@ class RobotTransport {
   void publish(const ros_Odometry& message);
   void publish(const ros_Imu& message);
   void publish(const ros_Float32MultiArray& message);
+  void publish_encoder_status(const char* status);
   void log(uint8_t level, const char* message);
   static int64_t monotonic_ns();
 
@@ -65,7 +66,7 @@ class RobotTransport {
   PicoRosCommandGuard guard_;
   picoros_node_t node_{};
   picoros_interface_t interface_{};
-  picoros_publisher_t odom_pub_{}, imu_pub_{}, state_pub_{}, log_pub_{}, time_pub_{};
+  picoros_publisher_t odom_pub_{}, imu_pub_{}, state_pub_{}, encoder_status_pub_{}, log_pub_{}, time_pub_{};
   picoros_subscriber_t manual_sub_{}, nav_sub_{}, mode_sub_{}, tuning_sub_{}, time_sub_{};
   Command commands_[2];
 #if ROBOT_TRANSPORT_DIAGNOSTICS
@@ -92,9 +93,11 @@ class RobotTransport {
   ros_Odometry odom_{};
   ros_Imu imu_{};
   float state_[7] = {};
+  char encoder_status_[64] = "starting";
   char log_text_[256] = {};
   uint8_t log_level_ = 20;
-  bool odom_pending_ = false, imu_pending_ = false, state_pending_ = false, log_pending_ = false;
+  bool odom_pending_ = false, imu_pending_ = false, state_pending_ = false;
+  bool encoder_status_pending_ = false, log_pending_ = false;
 #if ROBOT_TRANSPORT_DIAGNOSTICS
   uint32_t odom_overwritten_ = 0, imu_overwritten_ = 0;
   uint32_t odom_publish_ok_ = 0, odom_publish_fail_ = 0, odom_stale_ = 0;

@@ -128,11 +128,13 @@ def main():
         node = Node("picoros_integration_test")
         executor = SingleThreadedExecutor()
         executor.add_node(clock); executor.add_node(node)
-        odometry, imu_samples, states, ros_logs = [], [], [], []
+        odometry, imu_samples, states, encoder_statuses, ros_logs = [], [], [], [], []
         node.create_subscription(Odometry, "/wheel/odom", odometry.append, 10)
         node.create_subscription(Imu, "/imu/data", imu_samples.append,
                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         node.create_subscription(Float32MultiArray, "/motor/state", states.append, 10)
+        node.create_subscription(String, "/hardware/encoder/status",
+                                 encoder_statuses.append, 10)
         node.create_subscription(Log, "/rosout", lambda message: ros_logs.append(message.msg), 10)
         manual = node.create_publisher(TwistStamped, "/cmd_vel",
                                        QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
@@ -169,7 +171,9 @@ def main():
             return next((line == "STOP 1" for line in reversed(lines) if line.startswith("STOP ")), True)
 
         try:
-            wait(lambda: len(odometry) >= 3 and len(imu_samples) >= 3, "ROS did not receive synchronized telemetry", 20)
+            wait(lambda: len(odometry) >= 3 and len(imu_samples) >= 3 and
+                 encoder_statuses and encoder_statuses[-1].data == "ready",
+                 "ROS did not receive synchronized telemetry and encoder status", 20)
             wait(lambda: node.count_subscribers("/cmd_vel") >= 1 and
                  node.count_publishers("/wheel/odom") == 1 and node.count_publishers("/imu/data") == 1,
                  "Pico-ROS endpoints are missing from the ROS graph")

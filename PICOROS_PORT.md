@@ -162,19 +162,38 @@ probe. Constant probes remain limited to 5 s. For longer guarded sequences,
 right curves, opposite-direction wheel spins, and reverse, each followed by a
 0.25 s zero-command pause. The same profile accepts durations up to 300 s and
 varies its speed scale every 30 s. It aborts on stale sensors/motor feedback, mode changes, foreign command
-echoes, more than three encoder samples over 100 RPM in a rolling second, PWM
+echoes, more than three encoder samples over 140 RPM in a rolling second, PWM
 over 255, or 500 ms of requested wheel speed without encoder response. The
-firmware excludes each >100 RPM sample from odometry and PID feedback, holding
+firmware excludes each >140 RPM sample from odometry and PID feedback, holding
 the last valid measured RPM for PID; the requested RPM is never substituted as
 feedback. A fourth outlier in one second brakes both motors and latches motion
 disabled until an operator restarts the MCU. Raw RPM, pulse counts, ISR counts
 and minimum inter-edge intervals remain visible in telemetry/diagnostic logs.
-The encoder ISR rejects edges closer than 1166 µs, derived from the configured
-514.8 pulses/revolution and 100 RPM maximum. Raw, accepted and rejected edges
-are counted separately; rejected edges do not reset the last-accepted-edge
-timer. This threshold cannot suppress a pulse train within the configured RPM
-limit.
-The probe reports whether stillstand was confirmed; missing telemetry is never
+The GPIO diagnostic path rejects edges closer than 165 µs, derived from the
+configured 514.8 pulses/revolution and 140 RPM encoder guard. Raw, accepted and
+rejected edges are counted separately; rejected edges do not reset the
+last-accepted-edge timer. ESP32 PCNT units 0/1 count each A rising edge and
+sample B in hardware for direction, with the maximum 1023-cycle (12.8 µs)
+hardware pulse-width filter. PCNT signed count differences drive wheel
+odometry; the units remain running between reads and are cleared only near
+their counter limits. GPIO A-edge timestamps provide a median period estimate
+for PID and the 140 RPM feedback guard. It rejects only
+sub-200-µs electrical glitches, independently of the 130 RPM target limit,
+and does not convert rejected edges into synthetic RPM. PCNT count rate is
+used during estimator warm-up. `encoder_trace` reports PCNT/GPIO counts and
+estimated RPM.
+
+Firmware publishes `/hardware/encoder/status` (`ready` or a latched fault).
+A missing, stale or non-ready status blocks host hardware readiness and
+guarded validation.
+
+The host probe's `rpm_sweep` profile is a guarded 180-second straight-wheel
+test with six 30-second stages at 10, 25, 40, 60, 80 and 100 RPM, including a
+0.5-second zero-command pause at the end of each stage. It retains all normal
+freshness, feedback, target, PWM and stop-confirmation checks.
+The `rpm_hold` profile allows a bounded 0.1–5 second hold up to the 130 RPM
+target limit. The encoder feedback guard remains 140 RPM; communication and
+no-feedback watchdogs are unchanged. The probe reports whether stillstand was confirmed; missing telemetry is never
 counted as a confirmed stop. Host tests exercise these guards without
 connecting to the robot.
 

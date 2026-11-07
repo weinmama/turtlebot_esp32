@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
   float state[7] = {};
   ros_Float32MultiArray diagnostics{};
   diagnostics.data.data = state; diagnostics.data.n_elements = 7;
+  transport->publish_encoder_status("ready");
   bool was_stopped = true;
   for (int tick = 0; tick < 12000; ++tick) {
     ros_TwistStamped command{};
@@ -49,6 +50,7 @@ int main(int argc, char** argv) {
       transport->publish(imu);
       state[0] = stopped ? 1 : 0;
       transport->publish(diagnostics);
+      transport->publish_encoder_status("ready");
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }

@@ -33,8 +33,14 @@ class MotorFeedbackGuardTests(unittest.TestCase):
         self.guard.observe([14.0, 0.0, 101.0, 0.0, 40.0, 0.0, 0.1], 2.1)
 
     def test_aborts_immediately_for_target_above_rpm_limit(self):
-        with self.assertRaisesRegex(probe.SafetyViolation, "target exceeds 100 RPM"):
-            self.guard.observe([100.1, 0.0, 0.0, 0.0, 40.0, 0.0, 0.1], 1.0)
+        with self.assertRaisesRegex(probe.SafetyViolation, "target exceeds 130 RPM"):
+            self.guard.observe([130.1, 0.0, 0.0, 0.0, 40.0, 0.0, 0.1], 1.0)
+
+    def test_accepts_feedback_until_140_rpm_guard(self):
+        self.guard.observe([130.0, 0.0, 140.0, 0.0, 255.0, 0.0, 0.1], 1.0)
+        with self.assertRaisesRegex(probe.SafetyViolation, "more than 3 encoder samples"):
+            for now in (1.1, 1.2, 1.3, 1.4):
+                self.guard.observe([130.0, 0.0, 140.1, 0.0, 255.0, 0.0, 0.1], now)
 
     def test_aborts_immediately_above_pwm_limit(self):
         with self.assertRaisesRegex(probe.SafetyViolation, "PWM exceeds 255"):
@@ -92,6 +98,38 @@ class MixedProfileTests(unittest.TestCase):
                 _, vx, wz = probe.mixed_profile_command(cycle * 30 + phase * 5 + 1)
                 self.assertLessEqual(abs(vx), 0.05)
                 self.assertLessEqual(abs(wz), 0.3)
+
+
+class RpmSweepProfileTests(unittest.TestCase):
+    def test_three_minute_sweep_requests_stages_through_100_rpm(self):
+        expected = probe.RPM_SWEEP_RPM
+        for index, rpm in enumerate(expected):
+            phase, linear_x, angular_z, requested_rpm = probe.rpm_sweep_command(
+                index * probe.RPM_SWEEP_PHASE_S + 1.0)
+            self.assertEqual(requested_rpm, rpm)
+            self.assertEqual(phase, f"rpm_{rpm:g}")
+            self.assertAlmostEqual(
+                linear_x * 60.0 / probe.WHEEL_CIRCUMFERENCE_M, rpm)
+            self.assertEqual(angular_z, 0.0)
+            self.assertLessEqual(abs(linear_x), 100.0 * probe.WHEEL_CIRCUMFERENCE_M / 60.0)
+
+    def test_each_sweep_stage_ends_in_zero_command(self):
+        for index, rpm in enumerate(probe.RPM_SWEEP_RPM):
+            phase, vx, wz, requested_rpm = probe.rpm_sweep_command(
+                index * probe.RPM_SWEEP_PHASE_S + probe.RPM_SWEEP_PHASE_S - 0.1)
+            self.assertEqual(phase, f"rpm_{rpm:g}_pause")
+            self.assertEqual((vx, wz), (0.0, 0.0))
+            self.assertEqual(requested_rpm, rpm)
+
+
+class RpmHoldProfileTests(unittest.TestCase):
+    def test_hold_converts_130_rpm_without_exceeding_limit(self):
+        phase, vx, wz = probe.rpm_hold_command(130.0)
+        self.assertEqual(phase, "rpm_130")
+        self.assertEqual(wz, 0.0)
+        self.assertAlmostEqual(vx * 60 / probe.WHEEL_CIRCUMFERENCE_M, 130.0)
+        with self.assertRaises(SystemExit):
+            probe.parse_args(["--profile", "rpm_hold", "--wheel-rpm", "130.1", "--duration", "5"])
 
 
 if __name__ == "__main__":

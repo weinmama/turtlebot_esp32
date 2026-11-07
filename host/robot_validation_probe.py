@@ -28,6 +28,10 @@ MIXED_PROFILE_PHASES = (
 MIXED_PROFILE_CYCLE_S = 30.0
 MIXED_PROFILE_PHASE_S = 5.0
 MIXED_PROFILE_PAUSE_S = 0.25
+RPM_SWEEP_RPM = (10.0, 25.0, 40.0, 60.0, 80.0, 100.0)
+RPM_SWEEP_PHASE_S = 30.0
+RPM_SWEEP_PAUSE_S = 0.5
+WHEEL_CIRCUMFERENCE_M = 2.0 * math.pi * 0.034
 
 
 def mixed_profile_command(elapsed_s):
@@ -43,10 +47,29 @@ def mixed_profile_command(elapsed_s):
     return phase_name, linear_x * scale, angular_z * scale
 
 
+def rpm_sweep_command(elapsed_s):
+    """Return phase and straight-line command for the fixed three-minute sweep."""
+    bounded_elapsed = min(max(elapsed_s, 0.0), 6 * RPM_SWEEP_PHASE_S - 1e-9)
+    phase_index = min(int(bounded_elapsed // RPM_SWEEP_PHASE_S), 5)
+    target_rpm = RPM_SWEEP_RPM[phase_index]
+    phase_elapsed = bounded_elapsed % RPM_SWEEP_PHASE_S
+    if phase_elapsed >= RPM_SWEEP_PHASE_S - RPM_SWEEP_PAUSE_S:
+        return f"rpm_{target_rpm:g}_pause", 0.0, 0.0, target_rpm
+    linear_x = target_rpm * WHEEL_CIRCUMFERENCE_M / 60.0
+    return f"rpm_{target_rpm:g}", linear_x, 0.0, target_rpm
+
+
+def rpm_hold_command(target_rpm):
+    """Convert a bounded wheel RPM request into a straight-line command."""
+    linear_x = target_rpm * WHEEL_CIRCUMFERENCE_M / 60.0
+    return f"rpm_{target_rpm:g}", linear_x, 0.0
+
+
 class MotorFeedbackGuard:
     """Validate motor telemetry and fail on sustained commanded no-feedback."""
 
-    RPM_LIMIT = 100.0
+    RPM_LIMIT = 140.0
+    TARGET_RPM_LIMIT = 130.0
     PWM_LIMIT = 255.0
     MIN_TARGET_RPM = 5.0
     ZERO_RPM_EPSILON = 0.1
@@ -63,8 +86,8 @@ class MotorFeedbackGuard:
             raise SafetyViolation("motor/state must contain seven finite values")
 
         state = [float(v) for v in values]
-        if any(abs(v) > self.RPM_LIMIT for v in state[:2]):
-            raise SafetyViolation(f"motor target exceeds {self.RPM_LIMIT:g} RPM: {state}")
+        if any(abs(v) > self.TARGET_RPM_LIMIT for v in state[:2]):
+            raise SafetyViolation(f"motor target exceeds {self.TARGET_RPM_LIMIT:g} RPM: {state}")
         raw_outlier = any(abs(v) > self.RPM_LIMIT for v in state[2:4])
         while self.outlier_times and now - self.outlier_times[0] > self.OUTLIER_WINDOW_S:
             self.outlier_times.popleft()
@@ -100,11 +123,13 @@ class MotorFeedbackGuard:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("constant", "mixed"), default="constant")
+    parser.add_argument("--profile", choices=("constant", "mixed", "rpm_sweep", "rpm_hold"), default="constant")
     parser.add_argument("--linear-x", type=float, default=0.025)
     parser.add_argument("--angular-z", type=float, default=0.0)
+    parser.add_argument("--wheel-rpm", type=float, default=130.0,
+                        help="rpm_hold target; must be positive and no greater than 130")
     parser.add_argument("--duration", type=float, required=True,
-                        help="constant: 0.1-5 s; mixed profile: 30-300 s")
+                        help="constant/rpm_hold: 0.1-5 s; mixed: 30-300 s; rpm_sweep: exactly 180 s")
     args = parser.parse_args(argv)
     if args.profile == "constant":
         if not math.isfinite(args.linear_x) or abs(args.linear_x) > 0.05:
@@ -115,8 +140,16 @@ def parse_args(argv=None):
             parser.error("constant profile duration must be between 0.1 and 5 seconds")
         if abs(args.linear_x) < 1e-6 and abs(args.angular_z) < 1e-6:
             parser.error("a movement probe must request nonzero linear or angular velocity")
-    elif not math.isfinite(args.duration) or not 30.0 <= args.duration <= 300.0:
+    elif args.profile == "mixed" and (
+            not math.isfinite(args.duration) or not 30.0 <= args.duration <= 300.0):
         parser.error("mixed profile duration must be between 30 and 300 seconds")
+    elif args.profile == "rpm_sweep" and args.duration != 180.0:
+        parser.error("rpm_sweep duration must be exactly 180 seconds")
+    elif args.profile == "rpm_hold":
+        if not math.isfinite(args.wheel_rpm) or not 0.0 < args.wheel_rpm <= MotorFeedbackGuard.TARGET_RPM_LIMIT:
+            parser.error("--wheel-rpm must be positive and no greater than 130 RPM")
+        if not math.isfinite(args.duration) or not 0.1 <= args.duration <= 5.0:
+            parser.error("rpm_hold duration must be between 0.1 and 5 seconds")
     return args
 
 
@@ -156,6 +189,8 @@ def main(argv=None):
             self.create_subscription(Float32MultiArray, "/motor/state", self.on_motor, reliable)
             self.create_subscription(Int64MultiArray, "/hardware/time/reply", self.on_time, reliable)
             self.create_subscription(String, "/hardware/control_mode", self.on_mode, reliable)
+            self.create_subscription(String, "/hardware/encoder/status",
+                                     self.on_encoder_status, reliable)
             self.create_subscription(TwistStamped, "/cmd_vel", self.on_command_echo, best_effort)
             self.create_subscription(Log, "/rosout", self.on_rosout, reliable)
 
@@ -197,6 +232,16 @@ def main(argv=None):
             self.remember("mode", message)
             self.emit("mode", value=message.data)
 
+        def on_encoder_status(self, message):
+            changed = ("encoder_status" not in self.last or
+                       self.last["encoder_status"][1].data != message.data)
+            self.remember("encoder_status", message)
+            if changed:
+                self.emit("encoder_status", value=message.data)
+            if message.data != "ready" and self.fault is None:
+                self.fault = f"firmware encoder status is {message.data!r}"
+                self.emit("encoder_status_fault", reason=self.fault)
+
         def on_command_echo(self, message):
             stamp = stamp_ns(message)
             if stamp not in self.own_stamps:
@@ -232,9 +277,13 @@ def main(argv=None):
             if self.fault:
                 raise SafetyViolation(self.fault)
             for key, limit in (("odom", 0.30), ("imu", 0.30),
-                               ("motor", 0.25), ("mode", 0.25), ("time", 2.2)):
+                               ("motor", 0.25), ("mode", 0.25),
+                               ("encoder_status", 0.5), ("time", 2.2)):
                 if not self.fresh(key, limit):
                     raise SafetyViolation(f"{key} feedback stale/missing >{limit * 1000:.0f} ms")
+            if self.last["encoder_status"][1].data != "ready":
+                raise SafetyViolation(
+                    f"firmware encoder status is {self.last['encoder_status'][1].data!r}")
             if self.last["mode"][1].data != "idle":
                 raise SafetyViolation("control mode changed from idle")
             ros_now = self.get_clock().now().nanoseconds
@@ -316,11 +365,18 @@ def main(argv=None):
             elapsed = time.monotonic() - run_started
             if args.profile == "mixed":
                 phase, linear_x, angular_z = mixed_profile_command(elapsed)
+            elif args.profile == "rpm_sweep":
+                phase, linear_x, angular_z, requested_rpm = rpm_sweep_command(elapsed)
+            elif args.profile == "rpm_hold":
+                phase, linear_x, angular_z = rpm_hold_command(args.wheel_rpm)
+                requested_rpm = args.wheel_rpm
             else:
                 phase, linear_x, angular_z = "constant", args.linear_x, args.angular_z
             if phase != last_phase:
                 node.emit("profile_phase", phase=phase, elapsed_s=round(elapsed, 3),
-                          linear_x=linear_x, angular_z=angular_z)
+                          linear_x=linear_x, angular_z=angular_z,
+                          requested_wheel_rpm=(requested_rpm
+                                               if args.profile in ("rpm_sweep", "rpm_hold") else None))
                 last_phase = phase
             if time.monotonic() >= next_send:
                 node.send_twist(linear_x, angular_z, phase)
