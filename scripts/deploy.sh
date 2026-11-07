@@ -30,6 +30,11 @@ for component in microros-agent bridge; do
 done
 cd "$HOME/.local/share/turtlebox/picoros"
 compose config --quiet
+serial_image="$(compose config | awk '$0 == "  serial:" { serial=1; next } serial && $1 == "image:" { print $2; serial=0 }')"
+if [[ -z "$serial_image" ]] || ! docker image inspect "$serial_image" >/dev/null 2>&1; then
+    echo "Install the Pico-ROS serial router image before flashing: $serial_image (see PICOROS_PORT.md)" >&2
+    exit 1
+fi
 # Refuse to flash if the Pi still has the former single-router deployment.
 if ! compose config --services | grep -Fx serial >/dev/null ||
    [[ ! -f serial-router.json5 || ! -f wait-router.sh ]] ||

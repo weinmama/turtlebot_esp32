@@ -12,7 +12,7 @@ services:
     entrypoint: /ros_entrypoint.sh
     command: [ros2, run, rmw_zenoh_cpp, rmw_zenohd]
   serial:
-    image: ${PICOROS_HOST_IMAGE:-turtlebox-backend:lyrical}
+    image: ${PICOROS_SERIAL_IMAGE:-turtlebot-picoros-router:zenoh-1.8.0-congestion-fix}
     network_mode: host
     restart: unless-stopped
     depends_on: [router]
@@ -20,12 +20,10 @@ services:
       - ${ESP32_DEVICE:-/dev/esp32}:/dev/esp32
     volumes:
       - ./serial-router.json5:/config/serial-router.json5:ro
-      - ./wait-router.sh:/app/wait-router.sh:ro
-    environment:
-      ROS_DOMAIN_ID: "1"
-      ZENOH_ROUTER_CONFIG_URI: /config/serial-router.json5
-    entrypoint: /ros_entrypoint.sh
-    command: [bash, /app/wait-router.sh, ros2, run, rmw_zenoh_cpp, rmw_zenohd]
+    # Native Zenoh has the same pinned wire protocol plus the no-QoS TX fix.
+    # Router-mode connect retry waits for the central router without ROS or a
+    # second process opening the serial device.
+    command: [--config, /config/serial-router.json5]
   clock:
     image: ${PICOROS_HOST_IMAGE:-turtlebox-backend:lyrical}
     network_mode: host

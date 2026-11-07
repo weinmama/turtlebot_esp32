@@ -18,7 +18,11 @@ int main() {
   assert(clock.epoch(1020000000, epoch));
   assert(epoch == 1700000000010000000LL);
   assert(!clock.epoch(1019999999, epoch));
-  assert(!clock.epoch(1020000000LL + PicoRosTimeSync::kMaxAgeNs + 1, epoch));
+  // Holdover is allowed only while RTT/2 + conservative oscillator drift is
+  // within the explicit 100 ms uncertainty budget.
+  assert(clock.epoch(1020000000LL + 5000000000LL, epoch));
+  assert(clock.uncertainty_ns(1020000000LL + 5000000000LL) == 15000000LL);
+  assert(!clock.epoch(1020000000LL + 91000000000LL, epoch));
   clock.invalidate();
   assert(!clock.epoch(1020000000, epoch));
 
@@ -45,5 +49,9 @@ int main() {
   assert(!clock.update(600990000000LL, 601000000000LL, base + 601000000000LL));
   assert(!clock.update(601990000000LL, 602000000000LL, base + 603000000000LL));
   assert(clock.epoch(606000000000LL, epoch));
-  assert(!clock.epoch(606000000001LL, epoch));
+  assert(!clock.epoch(697000000000LL, epoch));
+  // Recover on the same clock instance, without invalidation or a reboot.
+  assert(clock.update(697000000000LL, 697020000000LL,
+                      base + 697010000000LL));
+  assert(clock.epoch(697020000000LL, epoch));
 }

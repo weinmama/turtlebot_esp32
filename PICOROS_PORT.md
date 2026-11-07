@@ -277,7 +277,8 @@ ssh pi@robot-pi.local \
 * Time requests contain a random boot ID, increasing request ID and monotonic
   send time. Replies must match the pending request exactly and arrive within
   100 ms. Matching replies are consumed once. Sensor stamps use the estimated
-  midpoint offset; clock loss stops command acceptance after five seconds.
+  midpoint offset; clock loss stops command acceptance when the bounded clock
+  uncertainty exceeds its budget (see timebase section below).
 * The two-second task watchdog covers startup handshakes too. Lost host clock
   service/session causes braking and a restart/reconnection attempt. Invalid
   IMU data is suppressed, and stale sensors prevent motor commands.
@@ -345,13 +346,110 @@ under `/tmp/opencode/uart-duplex-*`, including the two `three-roundtrips` logs.
 
 ### Timebase and damaged-frame recovery
 
+#### Rust serial-router congestion fix (Zenoh #2842)
+
+The ROS Lyrical router's Zenoh revision
+`2687c51352121f006e3a603ce07925a8ad0b295c` contains a no-QoS TX-pipeline bug:
+the producer marks congestion by message priority (Data = bit 5), but the
+consumer clears it by pipeline stage (the single no-QoS stage = bit 0). Once
+a burst exhausts the queue, subsequent droppable data can be discarded forever
+while keepalives and the reverse direction still work. Pico negotiates no QoS,
+so enabling QoS in the router configuration does not avoid the bug.
+
+The hardware failure was narrowed down using TCP capture (replies reached the
+serial router) and a short router process write trace (only keepalives reached
+UART). A finite reply-topic burst reproduces the same permanent loss in the
+isolated split-router test with the unmodified ROS router. This is not a slow
+Python responder or a timeout problem. See
+<https://github.com/eclipse-zenoh/zenoh/issues/2842>.
+
+`host/router/patch_pipeline.py` backports the stage-index fix and an actual Rust
+pipeline unit regression to the pinned source; no protocol upgrade is needed.
+`host/router/Dockerfile` builds a dedicated serial-router image. The central
+router and ClockResponder remain on the ROS image. Build/install before deploy:
+
+```sh
+docker buildx build --platform linux/arm64 --load \
+  -t turtlebot-picoros-router:zenoh-1.8.0-congestion-fix host/router
+docker save turtlebot-picoros-router:zenoh-1.8.0-congestion-fix | \
+  ssh pi@robot-pi.local docker load
+# Install the current host/compose.yaml and router configuration files as well.
+```
+
+The cross-build uses native build tools, so ARM emulation is not required.
+The deploy wrapper checks the configured serial image exists before stopping
+services or flashing. For isolated regression testing, first run the normal
+test suite and then `bash scripts/test_router.sh`. This builds a native patched
+router, induces over-capacity traffic, and requires fresh replies to resume on
+the same MCU boot in three separate-session split-router runs. Keepalives or
+continued Pi-side publish calls alone are not sufficient acceptance criteria.
+
+Both router configurations enable read-only Zenoh adminspace for inspecting
+routes and sessions; admin writes remain disabled.
+
+Hardware acceptance after installing the patched ARM64 serial-router image:
+300 s passive capture, stable MCU boot ID, valid clock throughout, no decode,
+request-send or recovery failures, and no need for subscriber reannouncements.
+The clock request/matched/accepted/callback counters advanced together. Odom
+was 9.99 Hz and IMU 19.97 Hz, with monotonic stamps and maximum observed sensor
+ages below 68 ms. Motor targets, measured RPM and PWM remained zero. No driving
+or physical congestion injection was performed. The over-capacity burst and
+same-boot recovery were tested in the isolated PTY topology (original fails;
+patched router passes three times), not by flooding the real robot.
+Evidence: `/tmp/opencode/clock-root-fix-hardware-300s.jsonl`,
+`clock-congestion-unfixed.log`, `clock-congestion-fixed.log`,
+`zenoh-pipeline-red.log`, `zenoh-pipeline-green.log` and
+`zenoh-router-reproducible-tests.log`.
+
 Clock offset corrections are slewed rather than stepped, so periodic Pi clock
 updates cannot make ROS sensor stamps move backwards. A reply with an RTT above
 100 ms, a delayed/replayed exchange, or an offset jump above 200 ms is ignored;
-it does not refresh clock liveness. The mapped clock expires after five seconds
-without a valid exchange, and the existing command/heartbeat watchdogs remain
-at 500 ms. These are intentional fail-safe limits, not values to widen to mask
-link loss.
+it does not refresh clock liveness. The mapped clock uses bounded holdover:
+RTT/2 plus 1000 ppm assumed oscillator drift must not exceed 100 ms. This is a
+conservative engineering assumption, not a measured hardware drift guarantee.
+Clock expiry blocks commands and timestamped telemetry without rebooting;
+1 Hz requests continue. The command/heartbeat watchdogs remain at 500 ms.
+
+After five consecutive exchanges without an accepted reply, the TX service
+reannounces only `/hardware/time/reply`'s subscriber (at most once per five
+seconds). This attempts to repair lost routing/interest state without resetting
+the MCU, serial port, motor task or clock. It cannot repair a physically broken
+link, and does not bypass RTT, epoch correction, replay or command-age checks.
+The routing cause of the hardware reply loss has not yet been proven.
+`include/picoros_reply_reannounce.h` uses the pinned Zenoh-Pico declaration API
+to refresh wire interest with a full topic key. It deliberately preserves the
+local subscriber callback, key resources and ROS liveliness token; full local
+teardown/recreation disrupted some split-router host-test runs. Review this
+adapter when updating the pinned Pico-ROS/Zenoh-Pico versions.
+The isolated integration test explicitly withdraws the MCU's wire interest
+while a host observer continues seeing Pi replies, verifies missed exchanges,
+and requires successful synchronization on the same boot ID after recovery.
+It also exercises repeated refreshes during responder loss, malformed replies,
+and diagnostic observers joining/leaving in TCP, serial PTY and split-router
+topologies. These tests do not establish the physical cause of the robot's loss.
+
+`/hardware/clock_diagnostic` has 24 int64 fields. The original fields 0–13 are
+unchanged: boot ID, requests, matched, accepted, unmatched, last/max RTT (ns),
+last result, clock valid, four rejection counters, last rejection. Appended:
+
+| Index | Meaning |
+| --- | --- |
+| 14 | consecutive exchanges without accepted reply |
+| 15 | age of last accepted sync in ns; -1 before first sync |
+| 16 | estimated uncertainty in ns; -1 when invalid/outside budget |
+| 17 | reply callback invocations, before decoding |
+| 18 | reply decode/shape failures |
+| 19 | age of last callback in ns; -1 before first callback |
+| 20 | last reply payload size in bytes |
+| 21 | request publication failures |
+| 22 | reply subscriber reannouncement attempts |
+| 23 | wire-interest refresh send failures |
+
+The Pi responder logs `clock_health` every five seconds, including request/reply
+counts, invalid requests, publish errors, last request identity and maximum
+synchronous publish duration. `replies` counts handoff to RMW, not delivery to
+the MCU. Compare it with callback/decode counters to distinguish missing delivery
+from CDR rejection; compare accepted/matched and RTT for late responses.
 
 The firmware's Pico-ROS serial reader drains a malformed/oversized COBS frame to
 its delimiter, checks the framing and CRC, and resumes at the next valid frame.

@@ -9,7 +9,12 @@ class PicoRosTimeSync {
  public:
   enum class UpdateResult : int64_t { accepted = 0, invalid = 1, round_trip = 2, nonmonotonic = 3, clock_step = 4 };
   static constexpr int64_t kMaxRoundTripNs = 100000000;  // 100 ms
-  static constexpr int64_t kMaxAgeNs = 5000000000LL;  // 5 s, also for telemetry
+  // Midpoint uncertainty is bounded by half the observed RTT. During holdover
+  // budget a deliberately conservative 1000 ppm oscillator drift. Time is
+  // usable only while their sum remains below 100 ms (below command-age and
+  // future-tolerance limits); this is not an arbitrary fixed age extension.
+  static constexpr int64_t kMaxUncertaintyNs = 100000000LL;
+  static constexpr int64_t kMaxDriftPpb = 1000000LL;
   static constexpr int64_t kMaxCorrectionNs = 200000000;  // reject clock steps
   static constexpr int64_t kSlewDivisor = 200;  // at most 5 ms correction / second
 
@@ -42,14 +47,15 @@ class PicoRosTimeSync {
     }
     target_offset_ns_ = target;
     last_sync_ns_ = received_ns;
+    last_rtt_ns_ = rtt;
     synced_ = true;
     if (result) *result = UpdateResult::accepted;
     return true;
   }
 
   bool epoch(int64_t monotonic_ns, int64_t& result) const {
-    if (!synced_ || monotonic_ns < last_sync_ns_ ||
-        monotonic_ns - last_sync_ns_ > kMaxAgeNs) return false;
+    if (!synced_ || monotonic_ns < last_sync_ns_) return false;
+    if (uncertainty_ns(monotonic_ns) < 0) return false;
     const int64_t offset = offset_at(monotonic_ns);
     if (offset > 0 && monotonic_ns > std::numeric_limits<int64_t>::max() - offset) return false;
     result = monotonic_ns + offset;
@@ -57,6 +63,15 @@ class PicoRosTimeSync {
   }
 
   void invalidate() { synced_ = false; }
+
+  int64_t uncertainty_ns(int64_t monotonic_ns) const {
+    if (!synced_ || monotonic_ns < last_sync_ns_) return -1;
+    const int64_t age_ns = monotonic_ns - last_sync_ns_;
+    const int64_t drift_ns = age_ns / 1000000000LL * kMaxDriftPpb +
+        (age_ns % 1000000000LL) * kMaxDriftPpb / 1000000000LL;
+    if (last_rtt_ns_ / 2 > kMaxUncertaintyNs - drift_ns) return -1;
+    return last_rtt_ns_ / 2 + drift_ns;
+  }
 
  private:
   int64_t offset_at(int64_t now) const {
@@ -69,4 +84,5 @@ class PicoRosTimeSync {
   int64_t offset_ns_ = 0;
   int64_t target_offset_ns_ = 0;
   int64_t last_sync_ns_ = 0;
+  int64_t last_rtt_ns_ = 0;
 };

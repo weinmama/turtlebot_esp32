@@ -4,4 +4,5 @@
   scouting: { multicast: { enabled: true } },
   // ROS discovery tokens must be routed between MCU and host sessions.
   routing: { router: { peers_failover_brokering: true } },
+  adminspace: { enabled: true, permissions: { read: true, write: false } },
 }

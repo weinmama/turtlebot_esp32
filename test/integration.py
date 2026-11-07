@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -26,6 +27,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", action="store_true")
     parser.add_argument("--split-router", action="store_true")
+    parser.add_argument("--separate-clock", action="store_true",
+                        help="Use a separate responder process/RMW session like the real Pi")
+    parser.add_argument("--congest-serial", action="store_true",
+                        help="Overload the isolated MCU reply link, then require clock delivery to recover")
     parser.add_argument("--duration", type=float, default=0,
                         help="Additional continuous command/telemetry soak in seconds")
     parser.add_argument("--fault-injection", action="store_true",
@@ -35,6 +40,8 @@ def main():
     args = parser.parse_args()
     if args.split_router and not args.serial:
         parser.error("--split-router requires --serial")
+    if args.congest_serial and not args.serial:
+        parser.error("--congest-serial requires --serial")
     if args.duration < 0 or (args.fault_injection and (not args.serial or args.duration <= 0)):
         parser.error("fault injection requires serial and a positive duration")
     if not 1 <= args.command_rate <= 120:
@@ -136,7 +143,10 @@ def main():
             edge_config_path.write_text(json.dumps(edge_config))
             edge_env = dict(env, ZENOH_ROUTER_CONFIG_URI=str(edge_config_path))
             edge_log = (directory / "serial-router.log").open("w+")
-            edge = subprocess.Popen(["/opt/ros/lyrical/lib/rmw_zenoh_cpp/rmw_zenohd"],
+            edge_binary = os.environ.get("PICOROS_TEST_SERIAL_ROUTER")
+            edge_command = [edge_binary, "--config", str(edge_config_path)] if edge_binary else \
+                ["/opt/ros/lyrical/lib/rmw_zenoh_cpp/rmw_zenohd"]
+            edge = subprocess.Popen(edge_command,
                                     env=edge_env, stdout=edge_log, stderr=subprocess.STDOUT)
             processes.append(edge)
         lines = []
@@ -146,7 +156,7 @@ def main():
             time.sleep(1.1)
         fixture_path = os.environ.get("PICOROS_TEST_FIXTURE", str(ROOT / ".pio/native/transport_fixture"))
         fixture = subprocess.Popen([fixture_path, locator],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         processes.append(fixture)
         def read_fixture():
             for line in fixture.stdout:
@@ -154,10 +164,20 @@ def main():
         threading.Thread(target=read_fixture, daemon=True).start()
 
         rclpy.init()
-        clock = ClockResponder()
+        clock = None
+        clock_log = None
+        if args.separate_clock:
+            clock_log = (directory / "clock.log").open("w+")
+            clock_process = subprocess.Popen([sys.executable, str(ROOT / "test/clock_responder_fixture.py")],
+                                             stdout=clock_log, stderr=subprocess.STDOUT)
+            processes.append(clock_process)
+        else:
+            clock = ClockResponder()
         node = Node("picoros_integration_test")
         executor = SingleThreadedExecutor()
-        executor.add_node(clock); executor.add_node(node)
+        if clock is not None:
+            executor.add_node(clock)
+        executor.add_node(node)
         odometry, imu_samples, states, encoder_statuses, ros_logs, reset_diagnostics, clock_diagnostics = [], [], [], [], [], [], []
         node.create_subscription(Odometry, "/wheel/odom", odometry.append, 10)
         node.create_subscription(Imu, "/imu/data", imu_samples.append,
@@ -210,7 +230,7 @@ def main():
             assert len(reset_diagnostics[-1].data) == 3
             assert list(reset_diagnostics[-1].data[1:]) == [7, 0x54520104]
             wait(lambda: bool(clock_diagnostics), "clock diagnostic was not delivered", 15)
-            assert len(clock_diagnostics[-1].data) == 14
+            assert len(clock_diagnostics[-1].data) == 24
             assert clock_diagnostics[-1].data[0] == reset_diagnostics[-1].data[0]
             assert clock_diagnostics[-1].data[3] <= clock_diagnostics[-1].data[2] <= clock_diagnostics[-1].data[1]
             wait(lambda: node.count_subscribers("/cmd_vel") >= 1 and
@@ -271,18 +291,91 @@ def main():
             tuning.publish(Float32MultiArray(data=[1.0] * 7)); spin(0.2)
             assert count("TUNING ") == before
 
+            # Diagnostic captures join/leave the reply topic while the MCU's
+            # subscription remains active. They must not break reply routing.
+            for _ in range(3):
+                observer = node.create_subscription(Int64MultiArray, "/hardware/time/reply", lambda _: None, 10)
+                spin(1.2)
+                node.destroy_subscription(observer)
+                accepted = clock_diagnostics[-1].data[3]
+                wait(lambda: clock_diagnostics[-1].data[3] > accepted,
+                     "clock replies stopped after diagnostic observer left", 4)
+
+            # Withdraw only the MCU's wire interest. A separate host observer
+            # still receives the responder's replies. Recovery must restore the
+            # real callback, not merely increase a diagnostic attempt counter.
+            observed_replies = []
+            observer = node.create_subscription(Int64MultiArray, "/hardware/time/reply", observed_replies.append, 10)
+            spin(0.2)
+            reannouncements = clock_diagnostics[-1].data[22]
+            boot_id = clock_diagnostics[-1].data[0]
+            fixture.stdin.write("WITHDRAW_TIME_INTEREST\n"); fixture.stdin.flush()
+            wait(lambda: "CLOCK_WIRE_WITHDRAWN 1" in lines, "test could not withdraw clock routing")
+            wait(lambda: clock_diagnostics[-1].data[14] >= 2,
+                 "withdrawn routing did not interrupt MCU clock delivery", 5)
+            accepted = clock_diagnostics[-1].data[3]
+            replies = len(observed_replies)
+            wait(lambda: len(observed_replies) > replies,
+                 "Pi observer did not see replies during MCU delivery loss", 2)
+            wait(lambda: clock_diagnostics[-1].data[3] > accepted and
+                 clock_diagnostics[-1].data[22] > reannouncements,
+                 "wire-interest refresh did not restore MCU clock replies", 8)
+            assert clock_diagnostics[-1].data[0] == boot_id, "routing recovery changed boot ID"
+            assert clock_diagnostics[-1].data[14] == 0
+            assert clock_diagnostics[-1].data[23] == 0
+            node.destroy_subscription(observer)
+
             mode = "mapping"; spin(0.25)
             # Spoofed/unmatched clock replies cannot refresh liveness.
-            executor.remove_node(clock)
-            for _ in range(60):
+            if clock is None:
+                clock_process.send_signal(signal.SIGUSR1)
+            else:
+                executor.remove_node(clock)
+            reannouncements = clock_diagnostics[-1].data[22]
+            decode_failures = clock_diagnostics[-1].data[18]
+            # Observe the recovery event rather than assuming a diagnostic
+            # snapshot at a fixed instant is already up to date on serial.
+            for _ in range(180):
                 fake_clock.publish(Int64MultiArray(data=[0, 1, 0, time.time_ns()]))
+                fake_clock.publish(Int64MultiArray(data=[1, 2, 3]))
                 command(); spin(0.1)
-            assert stopped(), "clock responder failure did not stop"
+                if (clock_diagnostics[-1].data[22] >= reannouncements + 2 and
+                        clock_diagnostics[-1].data[18] > decode_failures):
+                    break
+            assert clock_diagnostics[-1].data[22] >= reannouncements + 2, \
+                f"stalled reply channel was not reannounced: {list(clock_diagnostics[-1].data)}"
+            assert clock_diagnostics[-1].data[23] == 0, "reply subscription recovery failed"
+            assert clock_diagnostics[-1].data[18] > decode_failures, "malformed replies were not counted"
+            # Brief responder loss remains inside the measured uncertainty
+            # budget; bounded holdover is allowed, but spoofed replies are not.
+            assert not stopped(), "valid bounded clock holdover stopped"
             before = count(); command(); spin(0.2)
-            assert count() == before
-            executor.add_node(clock)
-            spin(1.5)
+            assert count() == before + 1, "bounded holdover rejected fresh command"
+            if clock is None:
+                clock_process.send_signal(signal.SIGUSR2)
+            else:
+                executor.add_node(clock)
+            accepted = clock_diagnostics[-1].data[3]
+            wait(lambda: clock_diagnostics[-1].data[3] > accepted,
+                 "clock did not synchronize after reply-channel recovery", 4)
+            assert clock_diagnostics[-1].data[14] == 0, "accepted reply did not clear consecutive failures"
+            before = count()
             command(); wait(lambda: count() == before + 1, "clock recovery failed")
+            if args.congest_serial:
+                # Finite, deliberately over-capacity burst on the isolated
+                # reply topic. These invalid IDs cannot synchronize the clock.
+                # Keepalives and successful Pi-side publish do not prove that
+                # the router's data pipeline recovered after congestion.
+                boot_id = clock_diagnostics[-1].data[0]
+                fake = Int64MultiArray(data=[0, 1, 0, time.time_ns()])
+                for _ in range(5000):
+                    fake_clock.publish(fake)
+                spin(3)
+                accepted = clock_diagnostics[-1].data[3]
+                wait(lambda: clock_diagnostics[-1].data[3] >= accepted + 3,
+                     f"serial TX data pipeline did not recover after congestion: {list(clock_diagnostics[-1].data)}", 10)
+                assert clock_diagnostics[-1].data[0] == boot_id
+                print("PASS: serial TX resumes fresh clock delivery after an over-capacity burst")
             if args.duration:
                 command_count_start = [0]
                 def soak_command():
@@ -299,6 +392,8 @@ def main():
                     while time.monotonic() - began < args.duration:
                         spin(0.05)
                         assert not stopped(), "unexpected watchdog stop during continuous commands"
+                        assert clock_diagnostics[-1].data[15] < 3_000_000_000, \
+                            f"clock replies stopped during soak: {list(clock_diagnostics[-1].data)}"
                         if args.fault_injection and time.monotonic() >= next_fault:
                             inject_frame.set()
                             next_fault = time.monotonic() + 5
@@ -348,14 +443,23 @@ def main():
         except Exception:
             router_log.flush(); router_log.seek(0)
             print("Router:", router_log.read(), file=sys.stderr)
+            if args.split_router:
+                edge_log.flush(); edge_log.seek(0)
+                print("Serial router:", edge_log.read(), file=sys.stderr)
             print("Fixture:", fixture.poll(), "\n".join(lines), file=sys.stderr)
             print("ROS diagnostics:", ros_logs, file=sys.stderr)
+            print("Last clock diagnostics:", [list(m.data) for m in clock_diagnostics[-5:]], file=sys.stderr)
+            if clock_log is not None:
+                clock_log.flush(); clock_log.seek(0)
+                print("Clock responder:", clock_log.read(), file=sys.stderr)
             print("Serial:", serial_trace, file=sys.stderr)
             raise
         finally:
             node.destroy_timer(timer)
             executor.shutdown()
-            clock.destroy_node(); node.destroy_node(); rclpy.shutdown()
+            if clock is not None:
+                clock.destroy_node()
+            node.destroy_node(); rclpy.shutdown()
             for process in reversed(processes):
                 process.terminate()
                 try:
@@ -368,6 +472,8 @@ def main():
             for descriptor in descriptors:
                 os.close(descriptor)
             router_log.close()
+            if clock_log is not None:
+                clock_log.close()
 
 
 if __name__ == "__main__":

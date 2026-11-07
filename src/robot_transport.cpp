@@ -1,4 +1,5 @@
 #include "robot_transport.h"
+#include "picoros_reply_reannounce.h"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -133,10 +134,15 @@ void RobotTransport::receive_time(uint8_t* bytes, size_t size) {
   ros_Int64MultiArray message{};
   message.data.data = values;
   message.data.n_elements = 4;
-  if (size > 64 || !robot_decode(bytes, size, message, ps_des_ros_Int64MultiArray) ||
-      message.data.n_deserialized != 4) return;
+  const bool decoded = size <= 64 && robot_decode(bytes, size, message, ps_des_ros_Int64MultiArray) &&
+      message.data.n_deserialized == 4 && message.layout.dim.n_deserialized == 0 &&
+      message.layout.data_offset == 0;
   auto& self = *instance_;
   std::lock_guard<std::mutex> lock(self.mutex_);
+  ++self.clock_rx_;
+  self.clock_rx_last_ns_ = received;
+  self.clock_rx_last_size_ = static_cast<int64_t>(size);
+  if (!decoded) { ++self.clock_decode_failed_; return; }
   if (!self.request_pending_ || values[0] != self.boot_id_ || values[1] != self.request_id_ ||
       values[2] != self.request_sent_ns_) { ++self.clock_unmatched_; return; }
   self.request_pending_ = false; // A matching reply may only be consumed once.
@@ -146,6 +152,8 @@ void RobotTransport::receive_time(uint8_t* bytes, size_t size) {
   PicoRosTimeSync::UpdateResult result;
   if (self.clock_.update(self.request_sent_ns_, received, values[3], &result)) {
     self.last_sync_ns_ = received;
+    self.clock_consecutive_misses_ = 0;
+    self.request_accepted_ = true;
     ++self.clock_accepted_;
   } else {
     const auto index = static_cast<int64_t>(result) - 1;
@@ -325,14 +333,33 @@ void RobotTransport::service() {
   last_service_start_ns_ = service_start_ns;
 #endif
   uint8_t bytes[1024];
+  bool redeclare_time = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int64_t now = monotonic_ns();
+    // Refresh only the reply subscription, not the session, UART or MCU. Lost
+    // routing/interest state must not leave us sending unanswered requests
+    // forever. Throttle retries and never hold the motor-task mutex over I/O.
+    redeclare_time = clock_consecutive_misses_ >= 5 &&
+        now - clock_redeclare_ns_ >= 5000000000LL;
+    if (redeclare_time) { clock_redeclare_ns_ = now; ++clock_redeclarations_; }
+  }
+  if (redeclare_time) {
+    if (!picoros_reply_reannounce(time_sub_)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++clock_redeclare_failed_;
+    }
+  }
   int64_t time_values[3];
   bool request = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const int64_t now = monotonic_ns();
     if (now - request_sent_ns_ >= 1000000000LL) {
+      if (request_id_ != 0 && !request_accepted_) ++clock_consecutive_misses_;
       request_sent_ns_ = now;
       request_pending_ = request = true;
+      request_accepted_ = false;
       ++clock_requests_;
       time_values[0] = boot_id_; time_values[1] = ++request_id_; time_values[2] = now;
     }
@@ -340,7 +367,10 @@ void RobotTransport::service() {
   if (request) {
     ros_Int64MultiArray message{};
     message.data.data = time_values; message.data.n_elements = 3;
-    send(time_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
+    if (!send(time_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray))) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++clock_request_send_failed_;
+    }
   }
   int64_t reset_values[3];
   bool send_reset = false;
@@ -361,7 +391,7 @@ void RobotTransport::service() {
     message.data.data = reset_values; message.data.n_elements = 3;
     send(reset_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
   }
-  int64_t clock_values[14];
+  int64_t clock_values[24];
   bool send_clock_diag = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -375,13 +405,23 @@ void RobotTransport::service() {
       clock_values[8] = clock_.epoch(now, epoch_ns) ? 1 : 0;
       for (size_t i = 0; i < 4; ++i) clock_values[9 + i] = clock_rejected_[i];
       clock_values[13] = clock_last_reject_;
+      clock_values[14] = clock_consecutive_misses_;
+      clock_values[15] = last_sync_ns_ == 0 ? -1 : now - last_sync_ns_;
+      clock_values[16] = clock_.uncertainty_ns(now);
+      clock_values[17] = clock_rx_;
+      clock_values[18] = clock_decode_failed_;
+      clock_values[19] = clock_rx_last_ns_ == 0 ? -1 : now - clock_rx_last_ns_;
+      clock_values[20] = clock_rx_last_size_;
+      clock_values[21] = clock_request_send_failed_;
+      clock_values[22] = clock_redeclarations_;
+      clock_values[23] = clock_redeclare_failed_;
       clock_diag_sent_ns_ = now;
       send_clock_diag = true;
     }
   }
   if (send_clock_diag) {
     ros_Int64MultiArray message{};
-    message.data.data = clock_values; message.data.n_elements = 14;
+    message.data.data = clock_values; message.data.n_elements = 24;
     send(clock_diag_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
   }
   // Copy under lock; never hold the control-task mutex during transport I/O.

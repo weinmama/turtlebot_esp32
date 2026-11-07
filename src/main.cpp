@@ -1002,7 +1002,6 @@ void setup() {
 // ---------------- Arduino loop ----------------
 void loop() {
   static int64_t last_imu_ms = 0, last_motor_ms = 0;
-  static int64_t started_ms = now_ms();
   if (transport.command(cmd_vel_msg, sensors_ready())) cmd_vel_callback(&cmd_vel_msg);
   if (transport.should_stop(sensors_ready())) {
     left_target_rpm_req = right_target_rpm_req = 0.0;
@@ -1025,11 +1024,17 @@ void loop() {
     last_imu_ms = now;
     imu_timer_callback();
   }
-  if (now - started_ms > 10000 && !transport.alive()) {
+  // A lost clock is a fail-closed condition, not a reason to reboot. Keep the
+  // transport and 1 Hz clock requests alive so a transient link outage can
+  // recover in place; should_stop() keeps the motor outputs disabled meanwhile.
+  if (!transport.alive()) {
     motor_left.brake();
     motor_right.brake();
     digitalWrite(STBY, LOW);
-    restart_with_reason(RESTART_CLOCK_EXPIRED);
+  } else {
+    // Re-enable the driver after in-place clock recovery. The command guard
+    // still requires fresh time, heartbeat, sensors and command before motion.
+    digitalWrite(STBY, HIGH);
   }
   esp_task_wdt_reset();
   delay(1);

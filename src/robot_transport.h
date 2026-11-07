@@ -41,6 +41,7 @@ class RobotTransport {
   static int64_t monotonic_ns();
 
  private:
+  friend struct RobotTransportTestAccess;
   struct Command {
     ros_TwistStamped message{};
     int64_t received_ns = 0;
@@ -93,6 +94,11 @@ class RobotTransport {
   bool request_pending_ = false, started_ = false;
   int64_t clock_requests_ = 0, clock_matched_ = 0, clock_accepted_ = 0, clock_unmatched_ = 0;
   int64_t clock_last_rtt_ns_ = -1, clock_max_rtt_ns_ = 0, clock_last_result_ = -1;
+  int64_t clock_consecutive_misses_ = 0;
+  bool request_accepted_ = false;
+  int64_t clock_rx_ = 0, clock_decode_failed_ = 0, clock_rx_last_ns_ = 0;
+  int64_t clock_rx_last_size_ = 0, clock_request_send_failed_ = 0;
+  int64_t clock_redeclare_ns_ = 0, clock_redeclarations_ = 0, clock_redeclare_failed_ = 0;
   int64_t clock_rejected_[4] = {};
   int64_t clock_last_reject_ = -1;
   int64_t clock_diag_sent_ns_ = 0;
