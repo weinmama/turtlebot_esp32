@@ -46,6 +46,8 @@ bool RobotTransport::begin(const char* locator) {
   PUB(encoder_status_pub_, "hardware/encoder/status", ros_String, Z_RELIABILITY_RELIABLE);
   PUB(log_pub_, "rosout", ros_Log, Z_RELIABILITY_RELIABLE);
   PUB(time_pub_, "hardware/time/request", ros_Int64MultiArray, Z_RELIABILITY_RELIABLE);
+  PUB(reset_pub_, "hardware/reset_diagnostic", ros_Int64MultiArray, Z_RELIABILITY_RELIABLE);
+  PUB(clock_diag_pub_, "hardware/clock_diagnostic", ros_Int64MultiArray, Z_RELIABILITY_RELIABLE);
   SUB(manual_sub_, "cmd_vel", ros_TwistStamped, receive_manual);
   SUB(nav_sub_, "hardware/nav_cmd_vel", ros_TwistStamped, receive_navigation);
   SUB(mode_sub_, "hardware/control_mode", ros_String, receive_mode);
@@ -136,9 +138,21 @@ void RobotTransport::receive_time(uint8_t* bytes, size_t size) {
   auto& self = *instance_;
   std::lock_guard<std::mutex> lock(self.mutex_);
   if (!self.request_pending_ || values[0] != self.boot_id_ || values[1] != self.request_id_ ||
-      values[2] != self.request_sent_ns_) return;
+      values[2] != self.request_sent_ns_) { ++self.clock_unmatched_; return; }
   self.request_pending_ = false; // A matching reply may only be consumed once.
-  if (self.clock_.update(self.request_sent_ns_, received, values[3])) self.last_sync_ns_ = received;
+  ++self.clock_matched_;
+  self.clock_last_rtt_ns_ = received - self.request_sent_ns_;
+  if (self.clock_last_rtt_ns_ > self.clock_max_rtt_ns_) self.clock_max_rtt_ns_ = self.clock_last_rtt_ns_;
+  PicoRosTimeSync::UpdateResult result;
+  if (self.clock_.update(self.request_sent_ns_, received, values[3], &result)) {
+    self.last_sync_ns_ = received;
+    ++self.clock_accepted_;
+  } else {
+    const auto index = static_cast<int64_t>(result) - 1;
+    if (index >= 0 && index < 4) ++self.clock_rejected_[index];
+    self.clock_last_reject_ = static_cast<int64_t>(result);
+  }
+  self.clock_last_result_ = static_cast<int64_t>(result);
 }
 
 bool RobotTransport::command(ros_TwistStamped& result, bool sensors_ready) {
@@ -149,7 +163,7 @@ bool RobotTransport::command(ros_TwistStamped& result, bool sensors_ready) {
   }
   int64_t epoch_ns = 0;
   const int64_t now = monotonic_ns();
-  const bool clock_valid = clock_.epoch(now, epoch_ns) && now - last_sync_ns_ <= 5000000000LL;
+  const bool clock_valid = clock_.epoch(now, epoch_ns);
   const unsigned source = mode_ == PicoRosCommandGuard::Mode::navigation ? 1 : 0;
 #if ROBOT_TRANSPORT_DIAGNOSTICS
   const unsigned other_source = source == 0 ? 1 : 0;
@@ -225,7 +239,7 @@ bool RobotTransport::should_stop(bool sensors_ready) {
   const int64_t now = monotonic_ns();
   int64_t stamp;
   return guard_.should_stop(now / 1000000,
-      clock_.epoch(now, stamp) && now - last_sync_ns_ <= 5000000000LL, sensors_ready);
+      clock_.epoch(now, stamp), sensors_ready);
 }
 
 bool RobotTransport::epoch(int64_t& stamp) {
@@ -235,7 +249,8 @@ bool RobotTransport::epoch(int64_t& stamp) {
 
 bool RobotTransport::alive() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return last_sync_ns_ && monotonic_ns() - last_sync_ns_ <= 5000000000LL;
+  int64_t stamp;
+  return clock_.epoch(monotonic_ns(), stamp);
 }
 
 void RobotTransport::publish(const ros_Odometry& message) {
@@ -261,6 +276,13 @@ void RobotTransport::publish_encoder_status(const char* status) {
   std::lock_guard<std::mutex> lock(mutex_);
   snprintf(encoder_status_, sizeof(encoder_status_), "%s", status ? status : "unknown");
   encoder_status_pending_ = true;
+}
+void RobotTransport::set_reset_diagnostic(int64_t reset_reason, int64_t software_reason) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  reset_reason_ = reset_reason;
+  software_reset_reason_ = software_reason;
+  reset_diagnostic_available_ = true;
+  reset_diagnostic_sent_ns_ = 0;
 }
 void RobotTransport::log(uint8_t level, const char* message) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -311,6 +333,7 @@ void RobotTransport::service() {
     if (now - request_sent_ns_ >= 1000000000LL) {
       request_sent_ns_ = now;
       request_pending_ = request = true;
+      ++clock_requests_;
       time_values[0] = boot_id_; time_values[1] = ++request_id_; time_values[2] = now;
     }
   }
@@ -318,6 +341,48 @@ void RobotTransport::service() {
     ros_Int64MultiArray message{};
     message.data.data = time_values; message.data.n_elements = 3;
     send(time_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
+  }
+  int64_t reset_values[3];
+  bool send_reset = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int64_t now = monotonic_ns();
+    if (reset_diagnostic_available_ &&
+        (reset_diagnostic_sent_ns_ == 0 || now - reset_diagnostic_sent_ns_ >= 10000000000LL)) {
+      reset_values[0] = boot_id_;
+      reset_values[1] = reset_reason_;
+      reset_values[2] = software_reset_reason_;
+      reset_diagnostic_sent_ns_ = now;
+      send_reset = true;
+    }
+  }
+  if (send_reset) {
+    ros_Int64MultiArray message{};
+    message.data.data = reset_values; message.data.n_elements = 3;
+    send(reset_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
+  }
+  int64_t clock_values[14];
+  bool send_clock_diag = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int64_t now = monotonic_ns();
+    if (clock_diag_sent_ns_ == 0 || now - clock_diag_sent_ns_ >= 1000000000LL) {
+      int64_t epoch_ns;
+      clock_values[0] = boot_id_; clock_values[1] = clock_requests_;
+      clock_values[2] = clock_matched_; clock_values[3] = clock_accepted_;
+      clock_values[4] = clock_unmatched_; clock_values[5] = clock_last_rtt_ns_;
+      clock_values[6] = clock_max_rtt_ns_; clock_values[7] = clock_last_result_;
+      clock_values[8] = clock_.epoch(now, epoch_ns) ? 1 : 0;
+      for (size_t i = 0; i < 4; ++i) clock_values[9 + i] = clock_rejected_[i];
+      clock_values[13] = clock_last_reject_;
+      clock_diag_sent_ns_ = now;
+      send_clock_diag = true;
+    }
+  }
+  if (send_clock_diag) {
+    ros_Int64MultiArray message{};
+    message.data.data = clock_values; message.data.n_elements = 14;
+    send(clock_diag_pub_, bytes, robot_encode(bytes, sizeof(bytes), message, ps_ser_ros_Int64MultiArray));
   }
   // Copy under lock; never hold the control-task mutex during transport I/O.
   ros_Odometry odom;

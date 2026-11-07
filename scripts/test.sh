@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 docker run --rm --network none \
     -u "$(id -u):$(id -g)" -e HOME=/tmp -e PICOROS_TEST_ISOLATED=1 \
+    -e PICOROS_SOAK_SECONDS="${PICOROS_SOAK_SECONDS:-0}" \
     -v "$root:/project" --entrypoint bash \
     "${PICOROS_TEST_IMAGE:-turtlebot-backend:test}" -lc '
         set -e
@@ -15,4 +16,8 @@ docker run --rm --network none \
         python3 /project/test/integration.py
         python3 /project/test/integration.py --serial
         python3 /project/test/integration.py --serial --split-router
+        if [ "$PICOROS_SOAK_SECONDS" != 0 ]; then
+            python3 /project/test/integration.py --serial --split-router \
+                --duration "$PICOROS_SOAK_SECONDS" --fault-injection
+        fi
     '

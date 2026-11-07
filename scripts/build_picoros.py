@@ -12,6 +12,9 @@ if not (zenoh / "CMakeLists.txt").exists():
     raise RuntimeError("Run git submodule update --init --recursive first")
 generated = Path(env.subst("$BUILD_DIR")) / "zenoh-config"
 patched = Path(env.subst("$BUILD_DIR")) / "zenoh-patched"
+subprocess.run([sys.executable, str(root / "scripts/patch_serial_rx.py"),
+                str(zenoh / "src/link/transport/upper/serial_protocol.c"),
+                str(patched / "serial_protocol.c")], check=True)
 subprocess.run([sys.executable, str(root / "scripts/patch_zenoh.py"),
                 str(zenoh / "src/transport/unicast/rx.c"), str(patched / "rx.c")], check=True)
 subprocess.run([sys.executable, str(root / "scripts/patch_arduino_uart.py"),
@@ -37,6 +40,7 @@ env.BuildSources("$BUILD_DIR/zenoh", str(zenoh / "src"), src_filter=[
     "+<system/arduino/esp32/>", "-<link/transport/tcp/>", "-<link/transport/udp/>",
     "-<transport/unicast/rx.c>",
     "-<link/transport/serial/uart_arduino_esp32.cpp>",
+    "-<link/transport/upper/serial_protocol.c>",
 ])
 env.BuildSources("$BUILD_DIR/zenoh-patched-objects", str(patched))
 env.BuildSources("$BUILD_DIR/picoros", str(pico / "src"),

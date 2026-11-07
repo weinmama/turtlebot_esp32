@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
   if (argc != 2) return 2;
   // Deliberately process-lifetime: network callbacks are active until _Exit.
   auto* transport = new RobotTransport;
+  transport->set_reset_diagnostic(7, 0x54520104);
   if (!transport->begin(argv[1])) return 3;
   std::thread([transport] {
     for (;;) { transport->service(); std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
@@ -30,7 +31,7 @@ int main(int argc, char** argv) {
   diagnostics.data.data = state; diagnostics.data.n_elements = 7;
   transport->publish_encoder_status("ready");
   bool was_stopped = true;
-  for (int tick = 0; tick < 12000; ++tick) {
+  for (uint64_t tick = 0; ; ++tick) {
     ros_TwistStamped command{};
     if (transport->command(command, true)) {
       printf("COMMAND %.6f %.6f\n", command.twist.linear.x, command.twist.angular.z);
@@ -44,13 +45,13 @@ int main(int argc, char** argv) {
     if (tick % 10 == 0 && transport->epoch(stamp)) {
       odom.header.stamp = {int32_t(stamp / 1000000000), uint32_t(stamp % 1000000000)};
       transport->publish(odom);
+      state[0] = stopped ? 1 : 0;
+      transport->publish(diagnostics);
+      transport->publish_encoder_status("ready");
     }
     if (tick % 5 == 0 && transport->epoch(stamp)) {
       imu.header.stamp = {int32_t(stamp / 1000000000), uint32_t(stamp % 1000000000)};
       transport->publish(imu);
-      state[0] = stopped ? 1 : 0;
-      transport->publish(diagnostics);
-      transport->publish_encoder_status("ready");
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }

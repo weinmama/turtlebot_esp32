@@ -32,6 +32,33 @@ RPM_SWEEP_RPM = (10.0, 25.0, 40.0, 60.0, 80.0, 100.0)
 RPM_SWEEP_PHASE_S = 30.0
 RPM_SWEEP_PAUSE_S = 0.5
 WHEEL_CIRCUMFERENCE_M = 2.0 * math.pi * 0.034
+WHEEL_BASE_M = 0.20
+MANEUVER_PHASES = (
+    ("forward_40rpm", 40.0, 40.0, 10.0),
+    ("forward_60rpm", 60.0, 60.0, 10.0),
+    ("forward_80rpm", 80.0, 80.0, 10.0),
+    ("forward_100rpm", 100.0, 100.0, 15.0),
+    ("reverse_40rpm", -40.0, -40.0, 10.0),
+    ("reverse_60rpm", -60.0, -60.0, 10.0),
+    ("reverse_80rpm", -80.0, -80.0, 10.0),
+    ("reverse_100rpm", -100.0, -100.0, 15.0),
+    ("curve_left_40_80rpm", 40.0, 80.0, 15.0),
+    ("curve_right_80_40rpm", 80.0, 40.0, 15.0),
+    ("reverse_curve_left_40_80rpm", -40.0, -80.0, 15.0),
+    ("reverse_curve_right_80_40rpm", -80.0, -40.0, 15.0),
+    ("pivot_left_60rpm", -60.0, 60.0, 15.0),
+    ("pivot_right_80rpm", 80.0, -80.0, 15.0),
+)
+MANEUVER_SWEEP_S = sum(phase[3] for phase in MANEUVER_PHASES)
+MANEUVER_PHASE_PAUSE_S = 0.5
+JOYSTICK_LINEAR = 0.356047
+JOYSTICK_RIGHT = -3.56047
+
+
+def joystick_repro_command(elapsed_s):
+    if elapsed_s < 30.0:
+        return "full_forward", JOYSTICK_LINEAR, 0.0
+    return "full_forward_right", JOYSTICK_LINEAR, JOYSTICK_RIGHT
 
 
 def mixed_profile_command(elapsed_s):
@@ -63,6 +90,24 @@ def rpm_hold_command(target_rpm):
     """Convert a bounded wheel RPM request into a straight-line command."""
     linear_x = target_rpm * WHEEL_CIRCUMFERENCE_M / 60.0
     return f"rpm_{target_rpm:g}", linear_x, 0.0
+
+
+def maneuver_sweep_command(elapsed_s):
+    """Guarded wheel-RPM sweep; longer runs repeat the tested 180 s sequence."""
+    elapsed = max(elapsed_s, 0.0) % MANEUVER_SWEEP_S
+    start = 0.0
+    for name, left_rpm, right_rpm, duration in MANEUVER_PHASES:
+        if elapsed < start + duration:
+            phase_elapsed = elapsed - start
+            if phase_elapsed >= duration - MANEUVER_PHASE_PAUSE_S:
+                return f"{name}_pause", 0.0, 0.0, left_rpm, right_rpm
+            left_mps = left_rpm * WHEEL_CIRCUMFERENCE_M / 60.0
+            right_mps = right_rpm * WHEEL_CIRCUMFERENCE_M / 60.0
+            linear_x = (left_mps + right_mps) / 2.0
+            angular_z = (right_mps - left_mps) / WHEEL_BASE_M
+            return name, linear_x, angular_z, left_rpm, right_rpm
+        start += duration
+    raise AssertionError("maneuver profile phase table does not cover its duration")
 
 
 class MotorFeedbackGuard:
@@ -123,13 +168,13 @@ class MotorFeedbackGuard:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("constant", "mixed", "rpm_sweep", "rpm_hold"), default="constant")
+    parser.add_argument("--profile", choices=("constant", "mixed", "rpm_sweep", "rpm_hold", "maneuver_sweep", "joystick_repro", "joystick_forward"), default="constant")
     parser.add_argument("--linear-x", type=float, default=0.025)
     parser.add_argument("--angular-z", type=float, default=0.0)
     parser.add_argument("--wheel-rpm", type=float, default=130.0,
                         help="rpm_hold target; must be positive and no greater than 130")
     parser.add_argument("--duration", type=float, required=True,
-                        help="constant/rpm_hold: 0.1-5 s; mixed: 30-300 s; rpm_sweep: exactly 180 s")
+                        help="constant: 0.1-5 s; rpm_hold: 0.1-120 s; mixed: 30-600 s; rpm_sweep: 180 s; maneuver_sweep: 180 or 300 s")
     args = parser.parse_args(argv)
     if args.profile == "constant":
         if not math.isfinite(args.linear_x) or abs(args.linear_x) > 0.05:
@@ -141,15 +186,21 @@ def parse_args(argv=None):
         if abs(args.linear_x) < 1e-6 and abs(args.angular_z) < 1e-6:
             parser.error("a movement probe must request nonzero linear or angular velocity")
     elif args.profile == "mixed" and (
-            not math.isfinite(args.duration) or not 30.0 <= args.duration <= 300.0):
-        parser.error("mixed profile duration must be between 30 and 300 seconds")
+            not math.isfinite(args.duration) or not 30.0 <= args.duration <= 600.0):
+        parser.error("mixed profile duration must be between 30 and 600 seconds")
     elif args.profile == "rpm_sweep" and args.duration != 180.0:
         parser.error("rpm_sweep duration must be exactly 180 seconds")
+    elif args.profile == "maneuver_sweep" and args.duration not in (MANEUVER_SWEEP_S, 300.0):
+        parser.error("maneuver_sweep duration must be exactly 180 or 300 seconds")
+    elif args.profile == "joystick_repro" and args.duration != 60.0:
+        parser.error("joystick_repro duration must be exactly 60 seconds")
+    elif args.profile == "joystick_forward" and args.duration != 60.0:
+        parser.error("joystick_forward duration must be exactly 60 seconds")
     elif args.profile == "rpm_hold":
         if not math.isfinite(args.wheel_rpm) or not 0.0 < args.wheel_rpm <= MotorFeedbackGuard.TARGET_RPM_LIMIT:
             parser.error("--wheel-rpm must be positive and no greater than 130 RPM")
-        if not math.isfinite(args.duration) or not 0.1 <= args.duration <= 5.0:
-            parser.error("rpm_hold duration must be between 0.1 and 5 seconds")
+        if not math.isfinite(args.duration) or not 0.1 <= args.duration <= 120.0:
+            parser.error("rpm_hold duration must be between 0.1 and 120 seconds")
     return args
 
 
@@ -184,6 +235,7 @@ def main(argv=None):
             self.own_stamps = set()
             self.motor_guard = MotorFeedbackGuard()
             self.motor_sample_count = 0
+            self.reverse_feedback_since = [None, None]
             self.create_subscription(Odometry, "/wheel/odom", self.on_odom, reliable)
             self.create_subscription(Imu, "/imu/data", self.on_imu, best_effort)
             self.create_subscription(Float32MultiArray, "/motor/state", self.on_motor, reliable)
@@ -219,6 +271,20 @@ def main(argv=None):
             self.motor_sample_count += 1
             try:
                 values = self.motor_guard.observe(message.data, time.monotonic())
+                if args.profile == "joystick_repro":
+                    if any(abs(value) > self.motor_guard.RPM_LIMIT for value in values[2:4]):
+                        raise SafetyViolation(f"implausible encoder feedback: {values}")
+                    for wheel in range(2):
+                        if values[wheel] < -5.0:
+                            raise SafetyViolation(f"unexpected reverse wheel target: {values}")
+                        if values[wheel + 2] < -5.0:
+                            now = time.monotonic()
+                            if self.reverse_feedback_since[wheel] is None:
+                                self.reverse_feedback_since[wheel] = now
+                            elif now - self.reverse_feedback_since[wheel] >= 0.3:
+                                raise SafetyViolation(f"sustained reverse wheel feedback: {values}")
+                        else:
+                            self.reverse_feedback_since[wheel] = None
                 self.emit("motor", data=values)
             except SafetyViolation as error:
                 self.fault = str(error)
@@ -370,13 +436,21 @@ def main(argv=None):
             elif args.profile == "rpm_hold":
                 phase, linear_x, angular_z = rpm_hold_command(args.wheel_rpm)
                 requested_rpm = args.wheel_rpm
+            elif args.profile == "maneuver_sweep":
+                phase, linear_x, angular_z, left_rpm, right_rpm = maneuver_sweep_command(elapsed)
+            elif args.profile == "joystick_repro":
+                phase, linear_x, angular_z = joystick_repro_command(elapsed)
+            elif args.profile == "joystick_forward":
+                phase, linear_x, angular_z = "full_forward", JOYSTICK_LINEAR, 0.0
             else:
                 phase, linear_x, angular_z = "constant", args.linear_x, args.angular_z
             if phase != last_phase:
                 node.emit("profile_phase", phase=phase, elapsed_s=round(elapsed, 3),
                           linear_x=linear_x, angular_z=angular_z,
                           requested_wheel_rpm=(requested_rpm
-                                               if args.profile in ("rpm_sweep", "rpm_hold") else None))
+                                               if args.profile in ("rpm_sweep", "rpm_hold") else None),
+                          requested_wheel_rpm_pair=(left_rpm, right_rpm)
+                          if args.profile == "maneuver_sweep" else None)
                 last_phase = phase
             if time.monotonic() >= next_send:
                 node.send_twist(linear_x, angular_z, phase)

@@ -6,6 +6,8 @@
 #include "robot_transport.h"
 
 #include <esp_timer.h>
+#include <esp_system.h>
+#include <esp_attr.h>
 #include "esp_task_wdt.h"
 #include <driver/gpio.h>
 #include <driver/pcnt.h>
@@ -62,6 +64,19 @@ Adafruit_MPU6050 imu;
 
 // ---------------- Globals ----------------
 RobotTransport transport;
+// Retained only as an explanation for an intentional software restart. A
+// watchdog or brownout must not be mislabeled by an old software marker.
+RTC_NOINIT_ATTR static uint32_t software_restart_marker;
+enum : uint32_t {
+  RESTART_IMU_INIT = 0x54520101,
+  RESTART_TRANSPORT_INIT = 0x54520102,
+  RESTART_TX_TASK = 0x54520103,
+  RESTART_CLOCK_EXPIRED = 0x54520104,
+};
+static void restart_with_reason(uint32_t reason) {
+  software_restart_marker = reason;
+  esp_restart();
+}
 ros_TwistStamped cmd_vel_msg{};
 ros_Imu imu_msg{};
 ros_Odometry odom_msg{};
@@ -208,8 +223,11 @@ void isrLeft(void*) {
       encoder_min_edge_interval_us_L = interval;
   }
   encoder_last_edge_us_L = edge_us;
-  encoder_speed_estimator_L.record(edge_us);
   if (encoder_pulse_filter_L.accept(edge_us)) {
+    // Keep the speed estimator on the same accepted edge stream as PCNT and
+    // odometry. Feeding rejected raw glitches here can bias its period median
+    // high even when the pulse filter correctly rejects those edges elsewhere.
+    encoder_speed_estimator_L.record(edge_us);
     ticks_L += direction;
     ++encoder_events_L;
     ++encoder_events;
@@ -229,8 +247,8 @@ void isrRight(void*) {
       encoder_min_edge_interval_us_R = interval;
   }
   encoder_last_edge_us_R = edge_us;
-  encoder_speed_estimator_R.record(edge_us);
   if (encoder_pulse_filter_R.accept(edge_us)) {
+    encoder_speed_estimator_R.record(edge_us);
     ticks_R += direction;
     ++encoder_events_R;
     ++encoder_events;
@@ -847,6 +865,13 @@ void cmd_vel_callback(const ros_TwistStamped *msg) {
 
 // ---------------- Arduino setup ----------------
 void setup() {
+  const esp_reset_reason_t reset_reason = esp_reset_reason();
+  const uint32_t marker = software_restart_marker;
+  const bool known_marker = marker == RESTART_IMU_INIT || marker == RESTART_TRANSPORT_INIT ||
+      marker == RESTART_TX_TASK || marker == RESTART_CLOCK_EXPIRED;
+  const uint32_t software_reason = reset_reason == ESP_RST_SW && known_marker ? marker : 0;
+  software_restart_marker = 0;
+  transport.set_reset_diagnostic(static_cast<int64_t>(reset_reason), software_reason);
 
   // activate standby
   pinMode(STBY, OUTPUT);
@@ -908,7 +933,7 @@ void setup() {
   if (!imu.begin()) {
     digitalWrite(STBY, LOW);
     delay(1000);
-    esp_restart();
+    restart_with_reason(RESTART_IMU_INIT);
   }
 
   imu_msg.header.frame_id = const_cast<char*>("imu_link");
@@ -940,7 +965,7 @@ void setup() {
   if (!transport.begin()) {
     digitalWrite(STBY, LOW);
     delay(1000);
-    esp_restart();
+    restart_with_reason(RESTART_TRANSPORT_INIT);
   }
   if (!encoder_interrupts_ready) {
     char encoder_error[224];
@@ -968,7 +993,7 @@ void setup() {
         for (;;) { transport.service(); vTaskDelay(pdMS_TO_TICKS(5)); }
       }, "picoros_tx", 8192, nullptr, 1, nullptr) != pdPASS) {
     digitalWrite(STBY, LOW);
-    esp_restart();
+    restart_with_reason(RESTART_TX_TASK);
   }
   esp_task_wdt_reset();
   log_info("Pico-ROS initialized; waiting for clock, mode heartbeat and gyro calibration");
@@ -1004,7 +1029,7 @@ void loop() {
     motor_left.brake();
     motor_right.brake();
     digitalWrite(STBY, LOW);
-    esp_restart();
+    restart_with_reason(RESTART_CLOCK_EXPIRED);
   }
   esp_task_wdt_reset();
   delay(1);

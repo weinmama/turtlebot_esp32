@@ -36,6 +36,7 @@ class RobotTransport {
   void publish(const ros_Imu& message);
   void publish(const ros_Float32MultiArray& message);
   void publish_encoder_status(const char* status);
+  void set_reset_diagnostic(int64_t reset_reason, int64_t software_reason);
   void log(uint8_t level, const char* message);
   static int64_t monotonic_ns();
 
@@ -66,7 +67,7 @@ class RobotTransport {
   PicoRosCommandGuard guard_;
   picoros_node_t node_{};
   picoros_interface_t interface_{};
-  picoros_publisher_t odom_pub_{}, imu_pub_{}, state_pub_{}, encoder_status_pub_{}, log_pub_{}, time_pub_{};
+  picoros_publisher_t odom_pub_{}, imu_pub_{}, state_pub_{}, encoder_status_pub_{}, log_pub_{}, time_pub_{}, reset_pub_{}, clock_diag_pub_{};
   picoros_subscriber_t manual_sub_{}, nav_sub_{}, mode_sub_{}, tuning_sub_{}, time_sub_{};
   Command commands_[2];
 #if ROBOT_TRANSPORT_DIAGNOSTICS
@@ -90,6 +91,13 @@ class RobotTransport {
   uint32_t publish_max_us_[5] = {};
 #endif
   bool request_pending_ = false, started_ = false;
+  int64_t clock_requests_ = 0, clock_matched_ = 0, clock_accepted_ = 0, clock_unmatched_ = 0;
+  int64_t clock_last_rtt_ns_ = -1, clock_max_rtt_ns_ = 0, clock_last_result_ = -1;
+  int64_t clock_rejected_[4] = {};
+  int64_t clock_last_reject_ = -1;
+  int64_t clock_diag_sent_ns_ = 0;
+  int64_t reset_reason_ = 0, software_reset_reason_ = 0, reset_diagnostic_sent_ns_ = 0;
+  bool reset_diagnostic_available_ = false;
   ros_Odometry odom_{};
   ros_Imu imu_{};
   float state_[7] = {};

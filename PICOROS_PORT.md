@@ -97,6 +97,29 @@ firmware with the original deploy tool, then re-enable the two old services.
 | `/pid_tune` | `std_msgs/msg/Float32MultiArray` | three shared or six independent PID gains |
 | `/rosout` | `rcl_interfaces/msg/Log` | low-rate latest log, volatile |
 | `/hardware/time/request`, `/hardware/time/reply` | `std_msgs/msg/Int64MultiArray` | clock exchange, 1 Hz |
+| `/hardware/reset_diagnostic` | `std_msgs/msg/Int64MultiArray` | boot ID, ESP-IDF reset reason, intentional restart marker; every 10 s |
+| `/hardware/clock_diagnostic` | `std_msgs/msg/Int64MultiArray` | clock exchange counters, timing and rejection reasons; 1 Hz |
+
+The clock diagnostic values are `[boot_id, requests, matched, accepted,
+unmatched, last_rtt_ns, max_rtt_ns, last_result, valid, invalid_count,
+rtt_rejected, nonmonotonic_count, step_rejected, last_reject]`. Result codes
+are 0 accepted, 1 invalid, 2 round-trip above 100 ms, 3 nonmonotonic, and 4
+clock correction above 200 ms; -1 means no result/rejection yet. The counters
+are since the current boot. They report MCU-observed timing, not an independent
+measurement of the Pi clock's correctness. Clock thresholds and watchdogs are
+unchanged. This diagnostic adds one low-rate message per second and must be
+evaluated for its own effect on serial load.
+
+The reset diagnostic is a best-effort observation, not a safety control. Its
+three values are `[boot_id, esp_reset_reason, software_marker]`; boot ID matches
+the clock exchange. ESP-IDF reason values include 1 power-on, 3 software,
+4 panic, 5 interrupt watchdog, 6 task watchdog, 7 other watchdog and 9 brownout.
+The software marker is only meaningful for reason 3: `0x54520101` IMU init,
+`0x54520102` transport init, `0x54520103` TX task creation, and `0x54520104`
+clock invalidation. Zero or an unknown marker is inconclusive. It is stored in
+RTC no-init memory before a deliberate `esp_restart` and cleared at startup; power loss
+may erase it. No serial-console output is needed. A newly flashed diagnostic
+build is required to observe these fields; it cannot identify earlier resets.
 
 Transport diagnostics are **disabled by default** to avoid extra serial traffic
 and formatting work while driving. For investigation, add
@@ -160,7 +183,7 @@ convention. The tool rejects inputs outside ±0.05 m/s, ±0.3 rad/s and 5 s per
 probe. Constant probes remain limited to 5 s. For longer guarded sequences,
 `--profile mixed --duration 30` runs six 5 s phases: straight forward, left and
 right curves, opposite-direction wheel spins, and reverse, each followed by a
-0.25 s zero-command pause. The same profile accepts durations up to 300 s and
+0.25 s zero-command pause. The same profile accepts durations up to 600 s and
 varies its speed scale every 30 s. It aborts on stale sensors/motor feedback, mode changes, foreign command
 echoes, more than three encoder samples over 140 RPM in a rolling second, PWM
 over 255, or 500 ms of requested wheel speed without encoder response. The
@@ -191,6 +214,13 @@ The host probe's `rpm_sweep` profile is a guarded 180-second straight-wheel
 test with six 30-second stages at 10, 25, 40, 60, 80 and 100 RPM, including a
 0.5-second zero-command pause at the end of each stage. It retains all normal
 freshness, feedback, target, PWM and stop-confirmation checks.
+The `maneuver_sweep` profile is exactly 180 seconds and ramps through 40, 60,
+80 and 100 wheel RPM forward and reverse, then exercises forward/reverse curves
+and both in-place rotation directions. Its wheel targets remain at or below
+100 RPM; the usual 130 RPM command ceiling, 140 RPM encoder guard, sensor and
+motor feedback checks, abort behavior, zero-command cleanup and stop confirmation
+remain active. This is a moving robot test: run it only with a clear test area
+and immediately reachable emergency stop.
 The `rpm_hold` profile allows a bounded 0.1–5 second hold up to the 130 RPM
 target limit. The encoder feedback guard remains 140 RPM; communication and
 no-feedback watchdogs are unchanged. The probe reports whether stillstand was confirmed; missing telemetry is never
@@ -207,12 +237,19 @@ ssh pi@robot-pi.local \
   < host/robot_validation_probe.py \
   > /tmp/opencode/robot-validation-mixed-30s.jsonl
 
-# Only after reviewing a clean 30 s result:
+# Only after reviewing a clean 30 s result; use 600 for a 10-minute supervised soak:
 ssh pi@robot-pi.local \
   'docker exec -i turtlebox-hardware-backend /hardware-entrypoint.sh python3 - \
-    --profile mixed --duration 300' \
+     --profile mixed --duration 600' \
   < host/robot_validation_probe.py \
-  > /tmp/opencode/robot-validation-mixed-5min.jsonl
+  > /tmp/opencode/robot-validation-mixed-10min.jsonl
+
+# Supervised three-minute speed and maneuver test (moves the robot):
+ssh pi@robot-pi.local \
+  'docker exec -i turtlebox-hardware-backend /hardware-entrypoint.sh python3 - \
+     --profile maneuver_sweep --duration 180' \
+  < host/robot_validation_probe.py \
+  > /tmp/opencode/robot-validation-maneuver-sweep.jsonl
 ```
 
 * Pico-ROS and its Zenoh-Pico/Micro-CDR dependencies are pinned submodules.
@@ -305,3 +342,27 @@ The new host UART regression test keeps a simulated IDF TX call blocked while
 RX receives fragmented binary data, and checks error/short-write propagation.
 It verifies the adapter contract, not the physical UART. Hardware captures are
 under `/tmp/opencode/uart-duplex-*`, including the two `three-roundtrips` logs.
+
+### Timebase and damaged-frame recovery
+
+Clock offset corrections are slewed rather than stepped, so periodic Pi clock
+updates cannot make ROS sensor stamps move backwards. A reply with an RTT above
+100 ms, a delayed/replayed exchange, or an offset jump above 200 ms is ignored;
+it does not refresh clock liveness. The mapped clock expires after five seconds
+without a valid exchange, and the existing command/heartbeat watchdogs remain
+at 500 ms. These are intentional fail-safe limits, not values to widen to mask
+link loss.
+
+The firmware's Pico-ROS serial reader drains a malformed/oversized COBS frame to
+its delimiter, checks the framing and CRC, and resumes at the next valid frame.
+This prevents one damaged inbound frame from permanently ending command
+reception. A damaged or missing command still expires through the unchanged
+500-ms watchdog. Its host test injects malformed, truncated, oversized and
+single-byte-corrupted frames before a valid frame. The isolated integration
+soak can additionally run with `PICOROS_SOAK_SECONDS=600 bash scripts/test.sh`;
+it rate-limits the PTY relay to approximate 250000-baud 8N1 and exercises ten
+minutes of fresh command/telemetry exchange with periodic damaged frames. PTYs
+do not reproduce electrical noise or establish physical motor behavior.
+
+Transport diagnostics are off in normal builds to avoid adding a periodic
+`/rosout` frame while controlling. Enable them only for a specific investigation.

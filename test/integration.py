@@ -26,9 +26,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", action="store_true")
     parser.add_argument("--split-router", action="store_true")
+    parser.add_argument("--duration", type=float, default=0,
+                        help="Additional continuous command/telemetry soak in seconds")
+    parser.add_argument("--fault-injection", action="store_true",
+                        help="Inject damaged frames toward the simulated MCU during soak")
+    parser.add_argument("--command-rate", type=float, default=20.0,
+                        help="Continuous soak command frequency in Hz (1-120)")
     args = parser.parse_args()
     if args.split_router and not args.serial:
         parser.error("--split-router requires --serial")
+    if args.duration < 0 or (args.fault_injection and (not args.serial or args.duration <= 0)):
+        parser.error("fault injection requires serial and a positive duration")
+    if not 1 <= args.command_rate <= 120:
+        parser.error("command rate must be between 1 and 120 Hz")
     if os.environ.get("PICOROS_TEST_ISOLATED") != "1":
         raise RuntimeError("Run in a --network none container with PICOROS_TEST_ISOLATED=1")
     os.environ.update(ROS_DOMAIN_ID="1", RMW_IMPLEMENTATION="rmw_zenoh_cpp",
@@ -46,6 +56,8 @@ def main():
 
     processes, descriptors, serial_trace = [], [], []
     exit_relay = threading.Event()
+    inject_frame = threading.Event()
+    injected = []
     with tempfile.TemporaryDirectory(prefix="picoros-test-") as directory:
         directory = Path(directory)
         config = {"mode": "router", "listen": {"endpoints": ["tcp/127.0.0.1:17447"]},
@@ -65,15 +77,33 @@ def main():
             locator = f"serial/{os.ttyname(sb)}#baudrate=230400"
 
             def relay():
+                queues = {a: bytearray(), b: bytearray()}
+                next_send = {a: 0.0, b: 0.0}
                 while not exit_relay.is_set():
-                    ready, _, _ = select.select([a, b], [], [], 0.1)
+                    ready, _, _ = select.select([a, b], [], [], 0.001)
                     for source in ready:
                         data = os.read(source, 4096)
                         if len(serial_trace) < 12:
                             serial_trace.append(("host" if source == a else "mcu", data.hex()))
                         target = b if source == a else a
-                        while data:
-                            data = data[os.write(target, data):]
+                        if source == a and inject_frame.is_set() and b"\0" in data:
+                            end = data.rfind(b"\0") + 1
+                            # Invalid COBS, a truncated block and an oversized
+                            # frame. Never inject toward the real ROS router:
+                            # this exercises the MCU reader compiled above.
+                            faults = [b"\xff\x01\0", b"\x02\0", b"\x55" * 2000 + b"\0"]
+                            data = data[:end] + faults[len(injected) % len(faults)] + data[end:]
+                            injected.append(time.monotonic())
+                            inject_frame.clear()
+                        queues[target].extend(data)
+                    for target, queue in queues.items():
+                        now = time.monotonic()
+                        if queue and now >= next_send[target]:
+                            # 250000 baud, 8N1: budget 250 bytes / 10 ms in each
+                            # direction. PTYs alone unrealistically drain at RAM speed.
+                            sent = os.write(target, queue[:250])
+                            del queue[:sent]
+                            next_send[target] = now + sent / 25000
             relay_thread = threading.Thread(target=relay, daemon=True)
             relay_thread.start()
         config_path = directory / "router.json"
@@ -128,7 +158,7 @@ def main():
         node = Node("picoros_integration_test")
         executor = SingleThreadedExecutor()
         executor.add_node(clock); executor.add_node(node)
-        odometry, imu_samples, states, encoder_statuses, ros_logs = [], [], [], [], []
+        odometry, imu_samples, states, encoder_statuses, ros_logs, reset_diagnostics, clock_diagnostics = [], [], [], [], [], [], []
         node.create_subscription(Odometry, "/wheel/odom", odometry.append, 10)
         node.create_subscription(Imu, "/imu/data", imu_samples.append,
                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
@@ -136,8 +166,10 @@ def main():
         node.create_subscription(String, "/hardware/encoder/status",
                                  encoder_statuses.append, 10)
         node.create_subscription(Log, "/rosout", lambda message: ros_logs.append(message.msg), 10)
+        node.create_subscription(Int64MultiArray, "/hardware/reset_diagnostic", reset_diagnostics.append, 10)
+        node.create_subscription(Int64MultiArray, "/hardware/clock_diagnostic", clock_diagnostics.append, 10)
         manual = node.create_publisher(TwistStamped, "/cmd_vel",
-                                       QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+                                       QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         navigation = node.create_publisher(TwistStamped, "/hardware/nav_cmd_vel", 1)
         modes = node.create_publisher(String, "/hardware/control_mode", 1)
         tuning = node.create_publisher(Float32MultiArray, "/pid_tune", 1)
@@ -174,6 +206,13 @@ def main():
             wait(lambda: len(odometry) >= 3 and len(imu_samples) >= 3 and
                  encoder_statuses and encoder_statuses[-1].data == "ready",
                  "ROS did not receive synchronized telemetry and encoder status", 20)
+            wait(lambda: bool(reset_diagnostics), "reset diagnostic was not delivered", 15)
+            assert len(reset_diagnostics[-1].data) == 3
+            assert list(reset_diagnostics[-1].data[1:]) == [7, 0x54520104]
+            wait(lambda: bool(clock_diagnostics), "clock diagnostic was not delivered", 15)
+            assert len(clock_diagnostics[-1].data) == 14
+            assert clock_diagnostics[-1].data[0] == reset_diagnostics[-1].data[0]
+            assert clock_diagnostics[-1].data[3] <= clock_diagnostics[-1].data[2] <= clock_diagnostics[-1].data[1]
             wait(lambda: node.count_subscribers("/cmd_vel") >= 1 and
                  node.count_publishers("/wheel/odom") == 1 and node.count_publishers("/imu/data") == 1,
                  "Pico-ROS endpoints are missing from the ROS graph")
@@ -244,6 +283,47 @@ def main():
             executor.add_node(clock)
             spin(1.5)
             command(); wait(lambda: count() == before + 1, "clock recovery failed")
+            if args.duration:
+                command_count_start = [0]
+                def soak_command():
+                    command_count_start[0] += 1
+                    command()
+                command_timer = node.create_timer(1.0 / args.command_rate, soak_command)
+                try:
+                    spin(0.2)
+                    assert not stopped(), "soak did not start"
+                    line_start, odom_start, imu_start = len(lines), len(odometry), len(imu_samples)
+                    began = time.monotonic()
+                    next_fault = began + 2
+                    max_age = {"odom": 0.0, "imu": 0.0}
+                    while time.monotonic() - began < args.duration:
+                        spin(0.05)
+                        assert not stopped(), "unexpected watchdog stop during continuous commands"
+                        if args.fault_injection and time.monotonic() >= next_fault:
+                            inject_frame.set()
+                            next_fault = time.monotonic() + 5
+                        for label, samples in (("odom", odometry), ("imu", imu_samples)):
+                            stamp = samples[-1].header.stamp
+                            age = (time.time_ns() - (stamp.sec * 10**9 + stamp.nanosec)) / 1e9
+                            max_age[label] = max(max_age[label], age)
+                            assert -0.2 <= age < 0.3, f"{label} stale/future during soak: {age}"
+                    assert "STOP 1" not in lines[line_start:], "transient stop during soak"
+                    for label, samples, start, rate in (("odom", odometry, odom_start, 9),
+                                                        ("imu", imu_samples, imu_start, 18)):
+                        stamps = [m.header.stamp.sec * 10**9 + m.header.stamp.nanosec
+                                  for m in samples[start:]]
+                        assert len(stamps) >= args.duration * rate, f"{label} rate below {rate} Hz"
+                        assert all(b > a for a, b in zip(stamps, stamps[1:])), f"{label} time reversed"
+                    if args.fault_injection:
+                        assert len(injected) >= 1, "no damaged frames reached MCU"
+                    observed_rate = command_count_start[0] / (time.monotonic() - began + 0.2)
+                    assert observed_rate >= args.command_rate * 0.9, \
+                        f"command generator only achieved {observed_rate:.1f} Hz"
+                    print(f"PASS: {args.duration}s soak, command_rate={observed_rate:.1f}Hz, "
+                          f"injected={len(injected)}, max_age={max_age}")
+                finally:
+                    node.destroy_timer(command_timer)
+                wait(stopped, "command watchdog failed after soak", 2)
             if os.environ.get("ROBOT_TRANSPORT_DIAGNOSTICS") == "1":
                 wait(lambda: any(message.startswith("cmd_diag ") for message in ros_logs),
                      "transport command diagnostics were not published", 3)

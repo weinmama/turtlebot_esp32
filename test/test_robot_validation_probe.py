@@ -76,6 +76,11 @@ class MotorFeedbackGuardTests(unittest.TestCase):
 
 
 class MixedProfileTests(unittest.TestCase):
+    def test_ten_minute_profile_is_bounded_and_accepted(self):
+        self.assertEqual(probe.parse_args(["--profile", "mixed", "--duration", "600"]).duration, 600)
+        with self.assertRaises(SystemExit):
+            probe.parse_args(["--profile", "mixed", "--duration", "600.1"])
+
     def test_profile_covers_curves_counterrotation_reverse_and_pause(self):
         expected = ["straight_forward", "curve_left", "curve_right",
                     "spin_left", "spin_right", "straight_reverse"]
@@ -130,6 +135,75 @@ class RpmHoldProfileTests(unittest.TestCase):
         self.assertAlmostEqual(vx * 60 / probe.WHEEL_CIRCUMFERENCE_M, 130.0)
         with self.assertRaises(SystemExit):
             probe.parse_args(["--profile", "rpm_hold", "--wheel-rpm", "130.1", "--duration", "5"])
+        self.assertEqual(
+            probe.parse_args(["--profile", "rpm_hold", "--wheel-rpm", "130", "--duration", "120"]).duration,
+            120,
+        )
+        with self.assertRaises(SystemExit):
+            probe.parse_args(["--profile", "rpm_hold", "--wheel-rpm", "130", "--duration", "120.1"])
+
+
+class JoystickReproTests(unittest.TestCase):
+    def test_profile_switch_and_fixed_duration(self):
+        self.assertEqual(probe.joystick_repro_command(0), ("full_forward", 0.356047, 0.0))
+        self.assertEqual(probe.joystick_repro_command(30), ("full_forward_right", 0.356047, -3.56047))
+        self.assertEqual(probe.parse_args(["--profile", "joystick_repro", "--duration", "60"]).duration, 60)
+        self.assertEqual(probe.parse_args(["--profile", "joystick_forward", "--duration", "60"]).duration, 60)
+        with self.assertRaises(SystemExit):
+            probe.parse_args(["--profile", "joystick_repro", "--duration", "61"])
+
+
+class ManeuverSweepTests(unittest.TestCase):
+    def test_exact_three_minute_profile_covers_speeds_and_directions(self):
+        args = probe.parse_args(["--profile", "maneuver_sweep", "--duration", "180"])
+        self.assertEqual(args.duration, 180)
+        self.assertEqual(probe.MANEUVER_SWEEP_S, 180)
+        labels = {phase[0] for phase in probe.MANEUVER_PHASES}
+        self.assertTrue(any(label.startswith("forward_") for label in labels))
+        self.assertTrue(any(label.startswith("reverse_") for label in labels))
+        self.assertTrue(any(label.startswith("curve_left") for label in labels))
+        self.assertTrue(any(label.startswith("curve_right") for label in labels))
+        self.assertTrue(any(label.startswith("pivot_left") for label in labels))
+        self.assertTrue(any(label.startswith("pivot_right") for label in labels))
+        self.assertTrue(any("100rpm" in label for label in labels))
+
+    def test_five_minute_profile_repeats_the_tested_sweep(self):
+        args = probe.parse_args(["--profile", "maneuver_sweep", "--duration", "300"])
+        self.assertEqual(args.duration, 300)
+        self.assertEqual(probe.maneuver_sweep_command(30.0),
+                         probe.maneuver_sweep_command(210.0))
+        with self.assertRaises(SystemExit):
+            probe.parse_args(["--profile", "maneuver_sweep", "--duration", "301"])
+
+    def test_wheel_rpm_conversion_and_phase_brakes(self):
+        label, linear, angular, left, right = probe.maneuver_sweep_command(30.0)
+        self.assertEqual((label, left, right), ("forward_100rpm", 100.0, 100.0))
+        self.assertAlmostEqual(linear * 60 / probe.WHEEL_CIRCUMFERENCE_M, 100.0)
+        self.assertEqual(angular, 0.0)
+        label, linear, angular, left, right = probe.maneuver_sweep_command(44.6)
+        self.assertEqual((label, linear, angular), ("forward_100rpm_pause", 0.0, 0.0))
+        label, linear, angular, left, right = probe.maneuver_sweep_command(150.0)
+        self.assertEqual((label, left, right), ("pivot_left_60rpm", -60.0, 60.0))
+        self.assertAlmostEqual(linear, 0.0)
+        self.assertGreater(angular, 0.0)
+        label, linear, angular, left, right = probe.maneuver_sweep_command(165.0)
+        self.assertEqual((label, left, right), ("pivot_right_80rpm", 80.0, -80.0))
+        self.assertAlmostEqual(linear, 0.0)
+        self.assertLess(angular, 0.0)
+
+    def test_all_profile_commands_stay_below_130_rpm_motor_limit(self):
+        for phase_name, left_rpm, right_rpm, duration in probe.MANEUVER_PHASES:
+            for offset in (0.1, duration - 0.6):
+                label, linear, angular, _, _ = probe.maneuver_sweep_command(
+                    sum(item[3] for item in probe.MANEUVER_PHASES[:probe.MANEUVER_PHASES.index(
+                        (phase_name, left_rpm, right_rpm, duration))]) + offset)
+                implied_left = (linear - angular * probe.WHEEL_BASE_M / 2) * 60 / probe.WHEEL_CIRCUMFERENCE_M
+                implied_right = (linear + angular * probe.WHEEL_BASE_M / 2) * 60 / probe.WHEEL_CIRCUMFERENCE_M
+                if label.endswith("_pause"):
+                    self.assertEqual((linear, angular), (0.0, 0.0))
+                else:
+                    self.assertLessEqual(abs(implied_left), 100.0 + 1e-6)
+                    self.assertLessEqual(abs(implied_right), 100.0 + 1e-6)
 
 
 if __name__ == "__main__":
