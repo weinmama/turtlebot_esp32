@@ -81,8 +81,9 @@ existing `/hardware/control_mode` heartbeat. Do not run the old agent or bridge
 alongside this firmware. UART0 carries binary Zenoh exclusively: a serial
 monitor or text logging on that port interferes with transport.
 
-For rollback, stop these compose services, flash the `main` branch's micro-ROS
-firmware with the original deploy tool, then re-enable the two old services.
+This repository supports Pico-ROS only. The former micro-ROS deployment is not a
+supported runtime or rollback target; keep the host router, serial router and
+firmware on matching Pico-ROS revisions.
 
 ## ROS interface
 
